@@ -1,0 +1,25 @@
+# Arduino CLI build and cache
+.arduino-build/
+.arduino-data/
+.arduino-downloads/
+.arduino-user/
+bin/
+
+# Build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Compiled libraries
+*.so
+
+# SSH keys
+ssh/

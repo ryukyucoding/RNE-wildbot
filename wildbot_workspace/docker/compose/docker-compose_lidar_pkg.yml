@@ -1,0 +1,14 @@
+services:
+  lidar_pkg:
+    image: ghcr.io/screamlab/wildbot_base_image:latest
+    env_file:
+      - .env
+    networks:
+      - my_bridge_network
+    command: "ros2 run lidar_pkg lidar_nan_value_filter_node"
+
+# This will create a docker bridge network
+# You can see the network by docker network ls
+networks:
+  my_bridge_network:
+    driver: bridge

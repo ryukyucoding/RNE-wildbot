@@ -1,0 +1,17 @@
+services:
+  kros_car:
+    image: ghcr.io/screamlab/wildbot_base_image:latest
+    env_file:
+      - .env
+    devices:
+      - "/dev/usb_wheel:/dev/usb_wheel"
+      - "/dev/usb_robot_arm:/dev/usb_robot_arm"
+    volumes:
+      - ./configs:/configs:ro
+    networks:
+      - my_bridge_network
+    command: "ros2 launch kros_car bringup.launch.py"
+
+networks:
+  my_bridge_network:
+    driver: bridge

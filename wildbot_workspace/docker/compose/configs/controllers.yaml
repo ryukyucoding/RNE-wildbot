@@ -1,0 +1,61 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 15
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    base_controller:
+      type: diff_drive_controller/DiffDriveController
+
+    arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+base_controller:
+  ros__parameters:
+    left_wheel_names: ["wheel_1_joint", "wheel_2_joint"]
+    right_wheel_names: ["wheel_3_joint", "wheel_4_joint"]
+
+    wheel_separation: 0.274
+    wheel_separation_multiplier: 2.21
+
+
+    wheel_radius: 0.05035
+
+    publish_rate: 15.0
+    odom_frame_id: odom
+    base_frame_id: base_link
+    enable_odom_tf: false
+    cmd_vel_timeout: 0.5
+
+    linear:
+      x:
+        has_velocity_limits: true
+        max_velocity: 0.546
+        has_acceleration_limits: true
+        max_acceleration: 0.5
+        has_deceleration_limits: true
+        max_deceleration: -1.5
+    angular:
+      z:
+        has_velocity_limits: true
+        max_velocity: 3.983
+        has_acceleration_limits: true
+        max_acceleration: 1.0
+        has_deceleration_limits: true
+        max_deceleration: -3.0
+
+arm_controller:
+  ros__parameters:
+    joints:
+      - arm_1_joint
+      - arm_2_joint
+      - gripper_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    state_publish_rate: 15.0
+    action_monitor_rate: 10.0
+    allow_partial_joints_goal: false

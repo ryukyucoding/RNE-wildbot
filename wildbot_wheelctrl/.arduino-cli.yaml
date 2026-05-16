@@ -1,0 +1,9 @@
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
+directories:
+  data: /home/yu/wildbot_wheelctrl/.arduino-data
+  downloads: /home/yu/wildbot_wheelctrl/.arduino-downloads
+  user: /home/yu/wildbot_wheelctrl/.arduino-user
+library:
+  enable_unsafe_install: false

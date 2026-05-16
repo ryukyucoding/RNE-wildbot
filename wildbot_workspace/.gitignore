@@ -1,0 +1,20 @@
+.docker_build_hash
+
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Compiled libraries
+*.so
+
+# SSH keys
+ssh/
