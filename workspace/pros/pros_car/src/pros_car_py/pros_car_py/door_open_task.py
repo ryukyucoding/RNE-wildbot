@@ -483,7 +483,7 @@ def main():
     ik_solver       = PybulletRobotController(end_eff_index=5)
     car_controller  = CarController(ros_communicator, nav_processing)
     arm_controller  = ArmController(
-        ros_communicator, data_processor, ik_solver, num_joints=6
+        ros_communicator, data_processor, ik_solver, num_joints=5
     )
 
     task = DoorOpenTask(
