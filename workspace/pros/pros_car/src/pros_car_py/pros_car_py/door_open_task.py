@@ -31,6 +31,10 @@ import rclpy
 # State 0：導航目標點（門前約 0.5m，用 Foxglove 或 SLAM 實際量測後填入）
 DOOR_APPROACH_GOAL = [2.5, 1.0]   # [x, y] in map frame，請改成實際座標
 
+# YOLO 目標類別名稱 —— 對應你的模型訓練時使用的 class label
+# 常見標記名稱："knob"、"door_handle"、"handle"，請依實際模型調整
+YOLO_TARGET_LABEL = "knob"
+
 # State 1：旋轉搜尋時的最大等待次數（每次 sleep 0.1s，共 N * 0.1 秒）
 SEARCH_MAX_ITER = 200             # 200 * 0.1s = 20 秒
 
@@ -175,7 +179,11 @@ class DoorOpenTask:
 
     def _state_search(self):
         if self._iter == 0:
-            print("[State 1] 開始搜尋門把…")
+            print(f"[State 1] 開始搜尋門把，通知 YOLO 追蹤類別: '{YOLO_TARGET_LABEL}'")
+            # 告訴 YOLO 節點現在要追蹤的物件類別（門把/knob）
+            # YOLO 節點收到後，/yolo/target_info 才會回報該類別的偵測結果
+            self.rc.publish_target_label(YOLO_TARGET_LABEL)
+            time.sleep(0.3)  # 等 YOLO 節點處理完訂閱更新
 
         yolo = self.dp.get_yolo_target_info()
 
@@ -359,6 +367,12 @@ class DoorOpenTask:
     def _transition(self, new_state):
         """切換狀態並重置計數器"""
         print(f"[FSM] 狀態切換：{self.state} → {new_state}")
+
+        # 任務結束（成功或失敗）時清除 YOLO 追蹤目標，
+        # 避免影響後續其他任務的 YOLO 偵測結果
+        if new_state in (DoorOpenState.DONE, DoorOpenState.ERROR):
+            self.rc.publish_target_label("")
+
         self.state        = new_state
         self._iter        = 0
         self._press_count = 0
