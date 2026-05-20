@@ -45,6 +45,9 @@ SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 # State 2：對齊門把的像素容差（畫面寬度約 640px，小於此值視為置中）
 ALIGN_PIXEL_TOL = 60             # px
 
+# State 2.5：車子前進靠近門的停止深度（公尺），小於此值表示已夠近可以伸手臂
+DRIVE_STOP_DEPTH = 0.6            # 距門把 0.6m 內停車
+
 # State 3：IK 對齊容差（公尺）
 ARM_AIM_TOL = 0.04
 
@@ -67,11 +70,12 @@ class DoorOpenState:
     NAVIGATE_TO_DOOR = 0
     SEARCH_HANDLE    = 1
     ALIGN_CAR        = 2
-    ARM_AIM          = 3
-    ARM_APPROACH     = 4
-    PRESS_DOWN       = 5
-    OPEN_DOOR        = 6
-    DONE             = 7
+    DRIVE_TO_DOOR    = 3   # ← 新增：視覺對齊後開車靠近門
+    ARM_AIM          = 4
+    ARM_APPROACH     = 5
+    PRESS_DOWN       = 6
+    OPEN_DOOR        = 7
+    DONE             = 8
     ERROR            = 99
 
 
@@ -130,6 +134,8 @@ class DoorOpenTask:
             return self._state_search()
         elif self.state == DoorOpenState.ALIGN_CAR:
             return self._state_align_car()
+        elif self.state == DoorOpenState.DRIVE_TO_DOOR:
+            return self._state_drive_to_door()
         elif self.state == DoorOpenState.ARM_AIM:
             return self._state_arm_aim()
         elif self.state == DoorOpenState.ARM_APPROACH:
@@ -233,9 +239,9 @@ class DoorOpenTask:
         pixel_offset = yolo[2]   # 正 = 目標在右側，負 = 目標在左側
 
         if abs(pixel_offset) <= ALIGN_PIXEL_TOL:
-            print(f"[State 2] 對齊完成（offset={pixel_offset:.1f}px）")
+            print(f"[State 2] 對齊完成（offset={pixel_offset:.1f}px），開始前進靠近門")
             self.car.update_action("STOP")
-            self._transition(DoorOpenState.ARM_AIM)
+            self._transition(DoorOpenState.DRIVE_TO_DOOR)
             return False
 
         # 根據偏移方向旋轉
@@ -253,7 +259,52 @@ class DoorOpenTask:
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 3：手臂 IK 對準門把（先對齊，不碰到）
+    # State 3：前進靠近門，直到 YOLO 深度 < DRIVE_STOP_DEPTH
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _state_drive_to_door(self):
+        if self._iter == 0:
+            print(f"[State 3] 前進靠近門把，目標距離 < {DRIVE_STOP_DEPTH}m…")
+
+        yolo = self.dp.get_yolo_target_info()
+
+        if yolo is None or yolo[0] == 0:
+            # 前進中目標丟失（可能被遮到），先停車再回去搜尋
+            print("[State 3] 前進中目標丟失，停車回到搜尋")
+            self.car.update_action("STOP")
+            self._transition(DoorOpenState.SEARCH_HANDLE)
+            return False
+
+        depth = yolo[1]
+        pixel_offset = yolo[2]
+
+        # 已夠近，停車進入手臂對準
+        if 0 < depth < DRIVE_STOP_DEPTH:
+            print(f"[State 3] 已靠近門把（depth={depth:.3f}m），停車")
+            self.car.update_action("STOP")
+            self._transition(DoorOpenState.ARM_AIM)
+            return False
+
+        # 前進中若有偏移（> 容差的 2 倍），順手微調方向
+        if abs(pixel_offset) > ALIGN_PIXEL_TOL * 2:
+            if pixel_offset > 0:
+                self.car.update_action("RIGHT_FRONT")
+            else:
+                self.car.update_action("LEFT_FRONT")
+        else:
+            # 對準就直直前進
+            self.car.update_action("FORWARD_SLOW")
+
+        self._iter += 1
+        if self._iter > 400:   # 最多前進 40 秒防呆
+            print("[State 3] 前進逾時，任務失敗")
+            self._transition(DoorOpenState.ERROR)
+
+        time.sleep(0.1)
+        return False
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # State 4：手臂 IK 對準門把（先對齊，不碰到）
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_arm_aim(self):
