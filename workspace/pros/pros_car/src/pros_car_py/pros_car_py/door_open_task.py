@@ -45,11 +45,14 @@ SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 # State 2：對齊門把的像素容差（畫面寬度約 640px，小於此值視為置中）
 ALIGN_PIXEL_TOL = 60             # px
 
-# State 2.5：車子前進靠近門的停止深度（公尺）
-# ⚠️ 非常重要：實體手臂的總長度只有 19cm (0.19m)！
-# 必須讓車子開得非常靠近門，否則手臂絕對構不到。
-# 若攝影機在手臂後方 15cm，則 depth 必須小於 0.34m 手臂才碰得到。
-DRIVE_STOP_DEPTH = 0.28            # 距門把 0.28m 內停車
+# State 3：車子前進靠近門的停止深度（公尺）
+# 設定在 YOLO 還能穩定偵測的距離，不要太近導致看不到。
+DRIVE_STOP_DEPTH = 0.40            # 距門把 0.40m 內停車（YOLO 仍可偵測）
+
+# State 3→4 盲爬補償：停車後，因此距離手臂仍構不到，
+# 所以在 State 4 開始時，讓車子多向前盲爬一小段固定時間（秒）。
+# FORWARD_SLOW 約為 0.1 m/s → 0.15s ≈ 1.5cm，依實際速度調整。
+CREEP_DURATION = 1.5               # 停車後繼續盲爬的秒數（調大 = 靠更近）
 
 # State 4：手臂先移到門把「正上方」的偏移量（公尺）
 # 夾爪張開後，末端停在門把上方 5cm
@@ -129,6 +132,7 @@ class DoorOpenTask:
         self._nav_started = False      # State 0 是否已啟動導航執行緒
         self._last_knob_x = 0.4        # 門把 X 座標備份
         self._last_knob_z = 0.0        # 門把 Z 座標備份
+        self._last_knob_depth = None   # State 3 停車時的 YOLO 深度備份
 
     # ──────────────────────────────────────────────────────────────────────────
     # 主要介面
@@ -292,9 +296,10 @@ class DoorOpenTask:
         depth = yolo[1]
         pixel_offset = yolo[2]
 
-        # 已夠近，停車進入手臂對準
+        # 已夠近，記錄當前深度後停車，準備盲爬
         if 0 < depth < DRIVE_STOP_DEPTH:
-            print(f"[State 3] 已靠近門把（depth={depth:.3f}m），停車")
+            print(f"[State 3] 已靠近門把（depth={depth:.3f}m），停車並記錄深度")
+            self._last_knob_depth = depth   # 儲存停車時的深度，供 State 4 使用
             self.car.update_action("STOP")
             self._transition(DoorOpenState.ARM_AIM)
             return False
@@ -326,21 +331,30 @@ class DoorOpenTask:
 
         # 先張開夾爪
         self.arm.set_last_joint_angle(90.0)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
-        # 因為實體 YOLO 節點只發布了 Float32MultiArray，並沒有發布 TF 坐標，
-        # 我們直接讀取深度 (depth) 來計算手臂需要的 2D 坐標。
-        yolo = self.dp.get_yolo_target_info()
-        if yolo is None or yolo[0] == 0:
-            print("[State 4] YOLO 失去門把目標，任務失敗")
-            self._transition(DoorOpenState.ERROR)
-            return False
+        # ── 盲爬階段：用 State 3 停車時記錄的深度 ──────────────────────────
+        # 由於停車距離（DRIVE_STOP_DEPTH）仍超過手臂可達範圍，
+        # 在這裡讓車子再向前盲爬 CREEP_DURATION 秒，讓手臂能構到門把。
+        # 車子盲爬中 YOLO 可能看不到，完全正常。
+        saved_depth = getattr(self, '_last_knob_depth', None)
+        if saved_depth is None:
+            # 安全備援：直接再讀一次
+            yolo_fb = self.dp.get_yolo_target_info()
+            saved_depth = yolo_fb[1] if (yolo_fb and yolo_fb[0] == 1) else 0.40
 
-        depth = yolo[1]
-        x_target = depth + CAMERA_X_OFFSET
+        print(f"[State 4] 盲爬前記錄深度={saved_depth:.3f}m，開始向前盲爬 {CREEP_DURATION}s…")
+        self.car.update_action("FORWARD_SLOW")
+        time.sleep(CREEP_DURATION)
+        self.car.update_action("STOP")
+        time.sleep(0.3)
+        # ── 盲爬結束 ────────────────────────────────────────────────────────
+
+        # 利用停車時的深度（非盲爬後）計算手臂目標座標
+        # 盲爬的距離由 CREEP_DURATION × 車速 估算，直接合入 CAMERA_X_OFFSET 補償
+        x_target = saved_depth + CAMERA_X_OFFSET
         z_target = KNOB_Z_HEIGHT
-        
-        print(f"[State 4] 攝影機深度: {depth:.3f}m")
+
         print(f"[State 4] 計算出門把相對於手臂座標: X={x_target:.3f}m, Z={z_target:.3f}m")
 
         # 目標點：門把正上方 5cm（z + 0.05），x 對齊門把
