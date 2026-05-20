@@ -52,6 +52,15 @@ DRIVE_STOP_DEPTH = 0.6            # 距門把 0.6m 內停車
 # 夾爪張開後，末端停在門把上方 5cm
 PRESS_ABOVE_OFFSET = 0.05        # 5cm
 
+# State 4 & 5：實車機構補償參數 (取代缺失的 TF 坐標系)
+# 攝影機鏡頭到「手臂基座」的 X 軸距離補償 (公尺)
+# 例如：攝影機安裝在手臂後方 15cm，則寫 -0.15。
+# 這樣手臂距離門把 = depth + CAMERA_X_OFFSET
+CAMERA_X_OFFSET = -0.15
+
+# 門把相對於手臂基座的固定高度 (公尺)。請實際測量！
+KNOB_Z_HEIGHT = 0.05
+
 # State 5：夾爪合上後，向下壓的距離（公尺）
 # 往下壓 7cm（door handle 行程通常 5~8cm）
 PRESS_Z_DOWN = 0.07              # 7cm
@@ -313,20 +322,20 @@ class DoorOpenTask:
         self.arm.set_last_joint_angle(90.0)
         time.sleep(0.5)
 
-        # 最多重試 5 次等 TF 座標
-        for attempt in range(5):
-            coords = self.arm.get_target_relative_coords()
-            if coords is not None:
-                break
-            print(f"[State 4] 等待 TF 座標 ({attempt + 1}/5)…")
-            time.sleep(0.3)
-        else:
-            print("[State 4] 無法獲取門把 TF 座標，任務失敗")
+        # 因為實體 YOLO 節點只發布了 Float32MultiArray，並沒有發布 TF 坐標，
+        # 我們直接讀取深度 (depth) 來計算手臂需要的 2D 坐標。
+        yolo = self.dp.get_yolo_target_info()
+        if yolo is None or yolo[0] == 0:
+            print("[State 4] YOLO 失去門把目標，任務失敗")
             self._transition(DoorOpenState.ERROR)
             return False
 
-        x_target, z_target = coords
-        print(f"[State 4] 門把相對座標: X={x_target:.3f}m, Z={z_target:.3f}m")
+        depth = yolo[1]
+        x_target = depth + CAMERA_X_OFFSET
+        z_target = KNOB_Z_HEIGHT
+        
+        print(f"[State 4] 攝影機深度: {depth:.3f}m")
+        print(f"[State 4] 計算出門把相對於手臂座標: X={x_target:.3f}m, Z={z_target:.3f}m")
 
         # 目標點：門把正上方 5cm（z + 0.05），x 對齊門把
         x_above = x_target
