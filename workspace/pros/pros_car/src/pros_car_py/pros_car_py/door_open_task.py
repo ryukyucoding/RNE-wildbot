@@ -49,6 +49,10 @@ ALIGN_PIXEL_TOL = 60             # px
 # 設定在 YOLO 還能穩定偵測的距離，不要太近導致看不到。
 DRIVE_STOP_DEPTH = 0.40            # 距門把 0.40m 內停車（YOLO 仍可偵測）
 
+# State 3 逾時強制前進：如果 DRIVE_MAX_SECS 秒後還沒靠近（深度值怪異），
+# 就記錄當前深度強制繼續到 State 4，避免無限卡在 State 3。
+DRIVE_MAX_SECS = 8.0               # 最多前進 8 秒
+
 # State 3→4 盲爬補償：停車後，因此距離手臂仍構不到，
 # 所以在 State 4 開始時，讓車子多向前盲爬一小段固定時間（秒）。
 # FORWARD_SLOW 約為 0.1 m/s → 0.15s ≈ 1.5cm，依實際速度調整。
@@ -283,6 +287,7 @@ class DoorOpenTask:
     def _state_drive_to_door(self):
         if self._iter == 0:
             print(f"[State 3] 前進靠近門把，目標距離 < {DRIVE_STOP_DEPTH}m…")
+            self._drive_start = time.time()
 
         yolo = self.dp.get_yolo_target_info()
 
@@ -296,10 +301,22 @@ class DoorOpenTask:
         depth = yolo[1]
         pixel_offset = yolo[2]
 
-        # 已夠近，記錄當前深度後停車，準備盲爬
-        if 0 < depth < DRIVE_STOP_DEPTH:
-            print(f"[State 3] 已靠近門把（depth={depth:.3f}m），停車並記錄深度")
-            self._last_knob_depth = depth   # 儲存停車時的深度，供 State 4 使用
+        # ── 判斷是否夠近 ──────────────────────────────────────────
+        # 情況 A：深度有效且小於閾值
+        close_by_depth = (0 < depth < DRIVE_STOP_DEPTH)
+        # 情況 B：深度感測器回傳 0 或負數（太近量不到）→ 視為已貼近
+        invalid_depth = (depth <= 0)
+        # 情況 C：逾時強制繼續（避免卡死）
+        elapsed = time.time() - getattr(self, '_drive_start', time.time())
+        timed_out = (elapsed > DRIVE_MAX_SECS)
+
+        if close_by_depth or invalid_depth or timed_out:
+            reason = ("depth=" + f"{depth:.3f}m") if close_by_depth else \
+                     ("深度無效(太近)") if invalid_depth else \
+                     (f"逾時{elapsed:.1f}s")
+            saved = depth if depth > 0 else DRIVE_STOP_DEPTH
+            print(f"[State 3] 靠近門把（{reason}），停車記錄深度 {saved:.3f}m")
+            self._last_knob_depth = saved
             self.car.update_action("STOP")
             self._transition(DoorOpenState.ARM_AIM)
             return False
@@ -311,16 +328,12 @@ class DoorOpenTask:
             else:
                 self.car.update_action("LEFT_FRONT")
         else:
-            # 對準就直直前進
             self.car.update_action("FORWARD_SLOW")
 
         self._iter += 1
-        if self._iter > 400:   # 最多前進 40 秒防呆
-            print("[State 3] 前進逾時，任務失敗")
-            self._transition(DoorOpenState.ERROR)
-
         time.sleep(0.1)
         return False
+
 
     # ──────────────────────────────────────────────────────────────────────────
     # State 4：手臂移到門把正上方，夾爪張開
