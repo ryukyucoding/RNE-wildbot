@@ -384,11 +384,15 @@ class DoorOpenTask:
 
     def _state_press_down(self):
         if self._press_count == 0:
-            print("[State 5] 開始向下壓門把…")
+            print("[State 5] 開始下壓門把！第一步：夾爪夾緊門把 (10.0 度)")
+            self.arm.set_last_joint_angle(10.0)   # 10 度 = 夾緊夾爪
+            time.sleep(0.8)   # 等待夾爪完全夾牢門把
+            print("[State 5] 夾爪已夾牢，開始向下壓…")
 
         if self._press_count >= PRESS_STEPS:
-            print("[State 5] 門把已壓下")
-            time.sleep(0.5)   # 確保機械臂到位
+            print("[State 5] 門把已壓下，釋放夾爪 (70.0 度)")
+            self.arm.set_last_joint_angle(70.0)   # 壓完後張開夾爪
+            time.sleep(0.5)
             self._transition(DoorOpenState.OPEN_DOOR)
             return False
 
