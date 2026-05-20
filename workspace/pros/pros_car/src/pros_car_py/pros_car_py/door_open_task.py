@@ -384,15 +384,14 @@ class DoorOpenTask:
 
     def _state_press_down(self):
         if self._press_count == 0:
-            print("[State 5] 開始下壓門把！第一步：夾爪夾緊門把 (10.0 度)")
-            self.arm.set_last_joint_angle(10.0)   # 10 度 = 夾緊夾爪
-            time.sleep(0.8)   # 等待夾爪完全夾牢門把
-            print("[State 5] 夾爪已夾牢，開始向下壓…")
+            print("[State 5] 觸碰完成，先夾緊夾爪（10度）咬住門把…")
+            self.arm.set_last_joint_angle(10.0)   # 夾緊夾爪
+            time.sleep(0.8)                       # 等待夾爪咬合完成
+            print("[State 5] 開始向下壓門把…")
 
         if self._press_count >= PRESS_STEPS:
-            print("[State 5] 門把已壓下，釋放夾爪 (70.0 度)")
-            self.arm.set_last_joint_angle(70.0)   # 壓完後張開夾爪
-            time.sleep(0.5)
+            print("[State 5] 門把已壓下")
+            time.sleep(0.5)   # 確保機械臂到位
             self._transition(DoorOpenState.OPEN_DOOR)
             return False
 
@@ -432,10 +431,16 @@ class DoorOpenTask:
         """切換狀態並重置計數器"""
         print(f"[FSM] 狀態切換：{self.state} → {new_state}")
 
-        # 任務結束（成功或失敗）時清除 YOLO 追蹤目標，
-        # 避免影響後續其他任務的 YOLO 偵測結果
+        # 任務結束（成功或失敗）時清除 YOLO 追蹤目標，並釋放夾爪、重置手臂
         if new_state in (DoorOpenState.DONE, DoorOpenState.ERROR):
             self.rc.publish_target_label("")
+            try:
+                print("[FSM] 釋放夾爪並重置手臂姿態…")
+                self.arm.set_last_joint_angle(70.0)  # 鬆開夾爪（張開到最大）
+                time.sleep(0.5)
+                self.arm.reset_arm()                 # 回歸初始姿態
+            except Exception as e:
+                print(f"[FSM] 重置手臂失敗: {e}")
 
         self.state        = new_state
         self._iter        = 0
