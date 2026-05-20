@@ -68,14 +68,27 @@ class ArmController:
 
     def get_target_relative_coords(self):
         """獲取目標（YOLO 偵測到的 knob）相對於手臂基座的 2D 座標 (x, z)"""
-        target_marker = self.ros_communicator.latest_yolo_marker
-        if not target_marker:
+        # 優先使用實體 YOLO 發布的 /yolo/detection/position (PointStamped)
+        target_msg = self.ros_communicator.get_latest_yolo_detection_position()
+        
+        # 如果沒有，則退而求其次使用 /yolo/target_marker (Marker)
+        if target_msg is None:
+            target_msg = self.ros_communicator.latest_yolo_marker
+            
+        if not target_msg:
             return None
             
         target_map = PointStamped()
-        target_map.header.frame_id = target_marker.header.frame_id
+        target_map.header.frame_id = target_msg.header.frame_id
         target_map.header.stamp = self.ros_communicator.get_clock().now().to_msg()
-        target_map.point = target_marker.pose.position
+        
+        # 根據消息類型提取座標點
+        if hasattr(target_msg, 'point'):
+            target_map.point = target_msg.point
+        elif hasattr(target_msg, 'pose'):
+            target_map.point = target_msg.pose.position
+        else:
+            return None
 
         try:
             transform = self.tf_buffer.lookup_transform(
