@@ -39,7 +39,8 @@ SKIP_NAVIGATION = True
 YOLO_TARGET_LABEL = "knob"
 
 # State 1：旋轉搜尋時的最大等待次數（每次 sleep 0.1s，共 N * 0.1 秒）
-SEARCH_MAX_ITER = 200             # 200 * 0.1s = 20 秒
+# 設為 600（60秒）以確保車子有足夠時間至少原地旋轉滿一整圈（360度）
+SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 
 # State 2：對齊門把的像素容差（畫面寬度約 640px，小於此值視為置中）
 ALIGN_PIXEL_TOL = 60             # px
