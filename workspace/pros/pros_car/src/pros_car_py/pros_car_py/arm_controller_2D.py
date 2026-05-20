@@ -45,6 +45,58 @@ class ArmController:
         print(f"🦾 Arm Controller Initialized: {len(self.joint_limits)} Joints Managed.")
 
     # ==========================================
+    # Helper Methods for Door Opening Task FSM
+    # ==========================================
+    def ensure_joint_pos_initialized(self):
+        """Dummy method for FSM compatibility."""
+        pass
+
+    def set_last_joint_angle(self, target_angle):
+        """設定夾爪角度 (Joint 2)"""
+        min_angle = self.joint_limits[2]["min_angle"]
+        max_angle = self.joint_limits[2]["max_angle"]
+        clamped_angle = max(min(target_angle, max_angle), min_angle)
+        self.joint_angles[2] = clamped_angle
+        self._clamp_and_publish()
+        print(f"Gripper angle set to {clamped_angle} degrees.")
+
+    def move_to_2d_position(self, x, z, step=5.0, delay=0.1):
+        """計算 2D 逆運動學並平滑移動手臂到目標 (x, z) 座標"""
+        deg1, deg2 = self._calculate_2d_ik(x, z)
+        # 保持夾爪角度不動，只移動前兩個旋轉關節
+        self._smooth_move_to([deg1, deg2, None], step=step, delay=delay)
+
+    def get_target_relative_coords(self):
+        """獲取目標（YOLO 偵測到的 knob）相對於手臂基座的 2D 座標 (x, z)"""
+        target_marker = self.ros_communicator.latest_yolo_marker
+        if not target_marker:
+            return None
+            
+        target_map = PointStamped()
+        target_map.header.frame_id = target_marker.header.frame_id
+        target_map.header.stamp = self.ros_communicator.get_clock().now().to_msg()
+        target_map.point = target_marker.pose.position
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_link_name,
+                target_map.header.frame_id,
+                rclpy.time.Time()
+            )
+            target_base = tf2_geometry_msgs.do_transform_point(target_map, transform)
+            return target_base.point.x, target_base.point.z
+        except Exception as e:
+            print(f"⚠️ 座標轉換或 TF 失敗: {e}")
+            return None
+
+    def reset_arm(self):
+        """重置手臂到初始姿態"""
+        self.joint_angles = [joint["init"] for joint in self.joint_limits]
+        self._clamp_and_publish()
+        self._visualize_arm_lines()
+        print("手臂已重置為初始角度。")
+
+    # ==========================================
     # 2. 手動控制邏輯 (Manual Control)
     # ==========================================
     def manual_control(self, index, key):

@@ -115,6 +115,8 @@ class DoorOpenTask:
         self._press_count = 0          # State 5 已壓次數
         self._open_start  = None       # State 6 開始時間
         self._nav_started = False      # State 0 是否已啟動導航執行緒
+        self._last_knob_x = 0.4        # 門把 X 座標備份
+        self._last_knob_z = 0.0        # 門把 Z 座標備份
 
     # ──────────────────────────────────────────────────────────────────────────
     # 主要介面
@@ -304,102 +306,101 @@ class DoorOpenTask:
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 4：手臂 IK 對準門把（先對齊，不碰到）
+    # State 4：手臂 2D 瞄準門把前方
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_arm_aim(self):
-        print("[State 3] 手臂 IK 對準門把…")
-        self.arm.ensure_joint_pos_initialized()
+        print("[State 4] 2D 手臂開合並瞄準門把前緣…")
+        self.arm.set_last_joint_angle(90.0)  # 2D 夾爪開到最大（90度）
+        time.sleep(0.5)
 
-        # 開啟夾爪（最後一軸張開）
-        self.arm.set_last_joint_angle(70.0)
-        time.sleep(0.3)
+        coords = self.arm.get_target_relative_coords()
+        if coords is None:
+            print("[State 4] 尚未獲取到門把的 TF 座標，等待中...")
+            time.sleep(0.2)
+            return False
 
-        # 利用現有的 align_to_target_with_yolo_offset 對齊，
-        # 它會反覆微調直到畫面 offset 落在容差內，最多 10 次迭代
-        aligned = self.arm.align_to_target_with_yolo_offset(
-            step_size=0.06, tolerance=ARM_AIM_TOL
-        )
+        x_target, z_target = coords
+        print(f"[State 4] 門把相對座標: X={x_target:.3f}m, Z={z_target:.3f}m")
 
-        if aligned:
-            print("[State 3] 手臂對齊完成")
+        # 瞄準點：門把前緣 8cm (X - 0.08)，高度稍微高出 1.5cm (Z + 0.015) 以便下壓
+        x_aim = x_target - 0.08
+        z_aim = z_target + 0.015
+        print(f"[State 4] 手臂瞄準點: X={x_aim:.3f}m, Z={z_aim:.3f}m")
+
+        try:
+            self.arm.move_to_2d_position(x_aim, z_aim, step=3.0, delay=0.05)
+            print("[State 4] 手臂瞄準完成")
             self._transition(DoorOpenState.ARM_APPROACH)
-        else:
-            print("[State 3] 手臂對齊失敗，重試一次")
-            # 再試一次，若還是失敗才放棄
-            aligned = self.arm.align_to_target_with_yolo_offset(
-                step_size=0.04, tolerance=ARM_AIM_TOL
-            )
-            if aligned:
-                self._transition(DoorOpenState.ARM_APPROACH)
-            else:
-                print("[State 3] 手臂對齊失敗，任務失敗")
-                self._transition(DoorOpenState.ERROR)
+        except Exception as e:
+            print(f"[State 4] 2D IK 計算失敗: {e}")
+            self._transition(DoorOpenState.ERROR)
+            
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 4：手臂緩慢前伸直到觸碰門把
+    # State 5：手臂 2D 前伸至門把位置
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_arm_approach(self):
-        if self._iter == 0:
-            print("[State 4] 手臂前進觸碰門把…")
-
-        # 讀取深度相機正前方深度（YOLO 偵測到的物體深度）
-        yolo = self.dp.get_yolo_target_info()
-        depth = yolo[1] if (yolo is not None and yolo[0] == 1) else None
-
-        if depth is not None and 0 < depth < ARM_TOUCH_DEPTH:
-            # 已觸碰（深度小於觸碰閾值）
-            print(f"[State 4] 觸碰到門把（depth={depth:.3f}m）")
+        print("[State 5] 2D 手臂前伸觸碰門把…")
+        coords = self.arm.get_target_relative_coords()
+        if coords is None:
+            print("[State 5] 失去門把座標，使用前一次的位置前進...")
             self._transition(DoorOpenState.PRESS_DOWN)
             return False
 
-        if depth is not None and depth <= 0:
-            # 深度感測器回傳 -1（float）表示已非常近（< ~4cm），也算觸碰到
-            print(f"[State 4] 已非常接近門把（depth={depth}，視為觸碰）")
+        x_target, z_target = coords
+        # 前進到門把正上方
+        x_reach = x_target
+        z_reach = z_target + 0.01  # 稍微在門把正上方/正前方
+
+        print(f"[State 5] 伸向門把位置: X={x_reach:.3f}m, Z={z_reach:.3f}m")
+        try:
+            self.arm.move_to_2d_position(x_reach, z_reach, step=3.0, delay=0.05)
+            print("[State 5] 手臂已到達門把位置")
             self._transition(DoorOpenState.PRESS_DOWN)
-            return False
-
-        # 沿手臂末端執行器的「正前方向」前進一步（世界座標系）。
-        # get_forward_position() 會利用末端旋轉矩陣的 X 軸方向計算目標點，
-        # 確保是沿手臂朝向前進，而非世界座標系的固定軸。
-        target_pos = self.arm.get_forward_position(
-            offset_distance=ARM_APPROACH_STEP,
-            z_offset=0.0,   # 不需要額外的世界 Z 偏移
-        )
-        self.arm.move_to_position(target_pos)
-
-        self._iter += 1
-        if self._iter > 80:   # 最多前進 80 * 2cm = 160cm，防呆
-            print("[State 4] 手臂前進逾時，任務失敗")
+        except Exception as e:
+            print(f"[State 5] 2D IK 前伸失敗: {e}")
             self._transition(DoorOpenState.ERROR)
-
-        time.sleep(0.15)
+            
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 5：向下壓門把
+    # State 6：向下壓門把 (2D 下壓)
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_press_down(self):
         if self._press_count == 0:
-            print("[State 5] 觸碰完成，先夾緊夾爪（10度）咬住門把…")
-            self.arm.set_last_joint_angle(10.0)   # 夾緊夾爪
-            time.sleep(0.8)                       # 等待夾爪咬合完成
-            print("[State 5] 開始向下壓門把…")
+            print("[State 6] 觸碰完成，夾緊夾爪（20度）咬住門把…")
+            self.arm.set_last_joint_angle(20.0)   # 2D 夾爪夾緊為 20度
+            time.sleep(1.0)                       # 等待夾爪咬合完成
+            
+            # 獲取當前相對座標作為基準
+            coords = self.arm.get_target_relative_coords()
+            if coords is not None:
+                self._last_knob_x, self._last_knob_z = coords
+            else:
+                # 備用值
+                self._last_knob_x, self._last_knob_z = 0.4, 0.0
 
-        if self._press_count >= PRESS_STEPS:
-            print("[State 5] 門把已壓下")
-            time.sleep(0.5)   # 確保機械臂到位
-            self._transition(DoorOpenState.OPEN_DOOR)
-            return False
-
-        print(f"[State 5] 下壓步驟 {self._press_count + 1}/{PRESS_STEPS}")
-        # 末端沿世界 Z 軸向下移動
-        self.arm.move_end_effector(z_offset=PRESS_Z_STEP)
-        self._press_count += 1
-        time.sleep(0.3)
+            print(f"[State 6] 開始向下壓門把，基準: X={self._last_knob_x:.3f}m, Z={self._last_knob_z:.3f}m")
+            
+            # 下壓目標：Z 軸向下減少 7cm
+            x_press = self._last_knob_x
+            z_press = self._last_knob_z - 0.07
+            
+            try:
+                self.arm.move_to_2d_position(x_press, z_press, step=3.0, delay=0.05)
+                print("[State 6] 門把已壓下")
+                time.sleep(0.5)
+                self._transition(DoorOpenState.OPEN_DOOR)
+            except Exception as e:
+                print(f"[State 6] 下壓 2D IK 失敗: {e}")
+                self._transition(DoorOpenState.ERROR)
+            
+            self._press_count = 1
+            
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -436,7 +437,7 @@ class DoorOpenTask:
             self.rc.publish_target_label("")
             try:
                 print("[FSM] 釋放夾爪並重置手臂姿態…")
-                self.arm.set_last_joint_angle(70.0)  # 鬆開夾爪（張開到最大）
+                self.arm.set_last_joint_angle(90.0)  # 2D 鬆開夾爪（張開到最大為 90度）
                 time.sleep(0.5)
                 self.arm.reset_arm()                 # 回歸初始姿態
             except Exception as e:
@@ -459,11 +460,10 @@ def main():
         "door_open = pros_car_py.door_open_task:main",
     """
     from pros_car_py.car_controller   import CarController
-    from pros_car_py.arm_controller   import ArmController
+    from pros_car_py.arm_controller_2D import ArmController
     from pros_car_py.data_processor   import DataProcessor
     from pros_car_py.nav_processing   import Nav2Processing
     from pros_car_py.ros_communicator import RosCommunicator
-    from pros_car_py.ik_solver        import PybulletRobotController
 
     rclpy.init()
     ros_communicator = RosCommunicator()
@@ -480,11 +480,8 @@ def main():
 
     data_processor  = DataProcessor(ros_communicator)
     nav_processing  = Nav2Processing(ros_communicator, data_processor)
-    ik_solver       = PybulletRobotController(end_eff_index=5)
     car_controller  = CarController(ros_communicator, nav_processing)
-    arm_controller  = ArmController(
-        ros_communicator, data_processor, ik_solver, num_joints=5
-    )
+    arm_controller  = ArmController(ros_communicator, data_processor)
 
     task = DoorOpenTask(
         car_controller  = car_controller,
