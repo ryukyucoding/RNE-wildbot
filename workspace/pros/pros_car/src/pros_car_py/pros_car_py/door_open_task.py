@@ -31,6 +31,9 @@ import rclpy
 # State 0：導航目標點（門前約 0.5m，用 Foxglove 或 SLAM 實際量測後填入）
 DOOR_APPROACH_GOAL = [2.5, 1.0]   # [x, y] in map frame，請改成實際座標
 
+# 開發與測試專用：如果已經手動把車子開到門前，設為 True 可以直接跳過 Nav2 導航
+SKIP_NAVIGATION = True
+
 # YOLO 目標類別名稱 —— 對應你的模型訓練時使用的 class label
 # 常見標記名稱："knob"、"door_handle"、"handle"，請依實際模型調整
 YOLO_TARGET_LABEL = "knob"
@@ -97,7 +100,12 @@ class DoorOpenTask:
         self.dp   = data_processor
         self.rc   = ros_communicator
 
-        self.state        = DoorOpenState.NAVIGATE_TO_DOOR
+        # 根據設定決定初始狀態
+        if SKIP_NAVIGATION:
+            self.state = DoorOpenState.SEARCH_HANDLE
+        else:
+            self.state = DoorOpenState.NAVIGATE_TO_DOOR
+
         self._iter        = 0          # 通用計數器
         self._press_count = 0          # State 5 已壓次數
         self._open_start  = None       # State 6 開始時間
