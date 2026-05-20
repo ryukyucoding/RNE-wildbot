@@ -45,6 +45,14 @@ SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 # State 2：對齊門把的像素容差（畫面寬度約 640px，小於此值視為置中）
 ALIGN_PIXEL_TOL = 60             # px
 
+# State 2：YOLO 暫時丟失目標時的「耐心」幀數（0.1s/frame）
+# 在此期間停止旋轉並等待，而不是立刻回到搜尋
+ALIGN_PATIENCE = 20              # 2 秒
+
+# State 3：YOLO 暫時丟失目標時的「耐心」幀數
+# 在此期間以上次偵測到的地圖方向繼續前進，而不是立刻回到搜尋
+DRIVE_PATIENCE = 30              # 3 秒
+
 # State 3：車子前進靠近門的停止深度（公尺）
 # 設定在 YOLO 還能穩定偵測的距離，不要太近導致看不到。
 DRIVE_STOP_DEPTH = 0.40            # 距門把 0.40m 內停車（YOLO 仍可偵測）
@@ -137,6 +145,9 @@ class DoorOpenTask:
         self._last_knob_x = 0.4        # 門把 X 座標備份
         self._last_knob_z = 0.0        # 門把 Z 座標備份
         self._last_knob_depth = None   # State 3 停車時的 YOLO 深度備份
+        self._last_knob_map_pos = None # 最後一次偵測到 knob 的地圖座標 (x, y)
+        self._align_lost = 0           # State 2 連續丟失計數
+        self._drive_lost = 0           # State 3 連續丟失計數
 
     # ──────────────────────────────────────────────────────────────────────────
     # 主要介面
@@ -253,10 +264,23 @@ class DoorOpenTask:
         yolo = self.dp.get_yolo_target_info()
 
         if yolo is None or yolo[0] == 0:
-            # 目標丟失，回到搜尋
-            print("[State 2] 目標丟失，回到搜尋")
+            self._align_lost += 1
+            if self._align_lost <= ALIGN_PATIENCE:
+                # 暫停旋轉，等待 YOLO 重新偵測
+                self.car.update_action("STOP")
+                time.sleep(0.1)
+                return False
+            # 耐心耗盡 → 回到搜尋
+            print(f"[State 2] 目標丟失超過 {ALIGN_PATIENCE * 0.1:.1f}s，回到搜尋")
+            self._align_lost = 0
             self._transition(DoorOpenState.SEARCH_HANDLE)
             return False
+
+        # 偵測到了 → 重置丟失計數，更新地圖座標
+        self._align_lost = 0
+        depth = yolo[1]
+        if depth > 0:
+            self._save_knob_map_pos(depth)
 
         pixel_offset = yolo[2]   # 正 = 目標在右側，負 = 目標在左側
 
@@ -292,13 +316,31 @@ class DoorOpenTask:
         yolo = self.dp.get_yolo_target_info()
 
         if yolo is None or yolo[0] == 0:
-            # 前進中目標丟失（可能被遮到），先停車再回去搜尋
-            print("[State 3] 前進中目標丟失，停車回到搜尋")
+            self._drive_lost += 1
+            if self._drive_lost <= DRIVE_PATIENCE:
+                # YOLO 暫時失去目標，根據上次地圖座標繼續前進
+                action = self._heading_to_last_knob()
+                if action:
+                    self.car.update_action(action)
+                    if self._drive_lost == 1:
+                        print(f"[State 3] YOLO 暫時丟失，依地圖座標繼續前進 ({DRIVE_PATIENCE * 0.1:.0f}s 耐心)")
+                else:
+                    self.car.update_action("FORWARD_SLOW")  # 沒有地圖座標就直直走
+                time.sleep(0.1)
+                return False
+            # 耐心耗盡 → 回到搜尋
+            print(f"[State 3] 前進中目標持續丟失超過 {DRIVE_PATIENCE * 0.1:.0f}s，停車回到搜尋")
+            self._drive_lost = 0
             self.car.update_action("STOP")
             self._transition(DoorOpenState.SEARCH_HANDLE)
             return False
 
+        # 偵測到了 → 重置丟失計數，更新地圖座標
+        self._drive_lost = 0
         depth = yolo[1]
+        if depth > 0:
+            self._save_knob_map_pos(depth)
+
         pixel_offset = yolo[2]
 
         # ── 判斷是否夠近 ──────────────────────────────────────────
