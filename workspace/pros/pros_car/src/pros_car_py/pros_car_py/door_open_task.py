@@ -45,8 +45,11 @@ SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 # State 2：對齊門把的像素容差（畫面寬度約 640px，小於此值視為置中）
 ALIGN_PIXEL_TOL = 60             # px
 
-# State 2.5：車子前進靠近門的停止深度（公尺），小於此值表示已夠近可以伸手臂
-DRIVE_STOP_DEPTH = 0.6            # 距門把 0.6m 內停車
+# State 2.5：車子前進靠近門的停止深度（公尺）
+# ⚠️ 非常重要：實體手臂的總長度只有 19cm (0.19m)！
+# 必須讓車子開得非常靠近門，否則手臂絕對構不到。
+# 若攝影機在手臂後方 15cm，則 depth 必須小於 0.34m 手臂才碰得到。
+DRIVE_STOP_DEPTH = 0.28            # 距門把 0.28m 內停車
 
 # State 4：手臂先移到門把「正上方」的偏移量（公尺）
 # 夾爪張開後，末端停在門把上方 5cm
@@ -65,7 +68,10 @@ KNOB_Z_HEIGHT = 0.05
 # 往下壓 7cm（door handle 行程通常 5~8cm）
 PRESS_Z_DOWN = 0.07              # 7cm
 
-# State 6：後退開門的秒數
+# State 6：開門的車輛動作與時間
+# 如果是要往外拉門，請填 "BACKWARD_SLOW"
+# 如果是要往內推門，請填 "FORWARD_SLOW"
+DOOR_OPEN_ACTION = "BACKWARD_SLOW"
 OPEN_DOOR_DURATION = 2.5         # 秒
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,7 +413,7 @@ class DoorOpenTask:
         elapsed = time.time() - self._open_start
 
         if elapsed < OPEN_DOOR_DURATION:
-            self.car.update_action("BACKWARD_SLOW")
+            self.car.update_action(DOOR_OPEN_ACTION)
         else:
             self.car.update_action("STOP")
             print("[State 6] 開門完成！")
