@@ -7,9 +7,9 @@ door_open_task.py
   State 0  NAVIGATE_TO_DOOR    —— 使用 Nav2 導航至門前預設座標
   State 1  SEARCH_HANDLE       —— 原地旋轉直到 YOLO 偵測到門把
   State 2  ALIGN_CAR           —— 車身水平對齊門把（pixel offset 置中）
-  State 3  ARM_AIM             —— IK 解算，手臂末端瞄準門把前方
-  State 4  ARM_APPROACH        —— 手臂緩慢前伸直到深度感測觸碰
-  State 5  PRESS_DOWN          —— 末端向下壓（模擬壓門把）
+  State 3  DRIVE_TO_DOOR       —— 車子前進到門前（深度感測器停車）
+  State 4  ARM_AIM             —— 手臂（夾爪張開）移到門把正上方
+  State 5  PRESS_DOWN          —— 夾爪合上門把 → 直接往下壓
   State 6  OPEN_DOOR           —— 車子後退推開門
   State 7  DONE                —— 完成，重置手臂回歸初始姿態
 
@@ -18,7 +18,7 @@ door_open_task.py
   2. 在你的控制迴圈中呼叫 door_open_task.step()
   3. 或直接使用 door_open_task.run_blocking() 阻塞執行到結束
 
-ros2 run pros_car_py door_open  （需在 setup.py 加入 entry point）
+ros2 run pros_car_py door_open  （需在 setup.py 加入 entry點）
 """
 
 import time
@@ -48,16 +48,13 @@ ALIGN_PIXEL_TOL = 60             # px
 # State 2.5：車子前進靠近門的停止深度（公尺），小於此值表示已夠近可以伸手臂
 DRIVE_STOP_DEPTH = 0.6            # 距門把 0.6m 內停車
 
-# State 3：IK 對齊容差（公尺）
-ARM_AIM_TOL = 0.04
+# State 4：手臂先移到門把「正上方」的偏移量（公尺）
+# 夾爪張開後，末端停在門把上方 5cm
+PRESS_ABOVE_OFFSET = 0.05        # 5cm
 
-# State 4：手臂前進步長及目標距離
-ARM_APPROACH_STEP = 0.02         # 每步 2cm
-ARM_TOUCH_DEPTH   = 0.06         # 深度相機回傳值 < 6cm 表示已觸碰
-
-# State 5：壓下門把的總下移距離與步長
-PRESS_Z_STEP   = -0.015          # 每步向下 1.5cm
-PRESS_STEPS    = 4               # 共壓 4 步 ≈ 6cm
+# State 5：夾爪合上後，向下壓的距離（公尺）
+# 往下壓 7cm（door handle 行程通常 5~8cm）
+PRESS_Z_DOWN = 0.07              # 7cm
 
 # State 6：後退開門的秒數
 OPEN_DOOR_DURATION = 2.5         # 秒
@@ -306,101 +303,87 @@ class DoorOpenTask:
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 4：手臂 2D 瞄準門把前方
+    # State 4：手臂移到門把正上方，夾爪張開
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_arm_aim(self):
-        print("[State 4] 2D 手臂開合並瞄準門把前緣…")
-        self.arm.set_last_joint_angle(90.0)  # 2D 夾爪開到最大（90度）
+        print("[State 4] 夾爪張開，手臂移到門把正上方…")
+
+        # 先張開夾爪
+        self.arm.set_last_joint_angle(90.0)
         time.sleep(0.5)
 
-        coords = self.arm.get_target_relative_coords()
-        if coords is None:
-            print("[State 4] 尚未獲取到門把的 TF 座標，等待中...")
-            time.sleep(0.2)
+        # 最多重試 5 次等 TF 座標
+        for attempt in range(5):
+            coords = self.arm.get_target_relative_coords()
+            if coords is not None:
+                break
+            print(f"[State 4] 等待 TF 座標 ({attempt + 1}/5)…")
+            time.sleep(0.3)
+        else:
+            print("[State 4] 無法獲取門把 TF 座標，任務失敗")
+            self._transition(DoorOpenState.ERROR)
             return False
 
         x_target, z_target = coords
         print(f"[State 4] 門把相對座標: X={x_target:.3f}m, Z={z_target:.3f}m")
 
-        # 瞄準點：門把前緣 8cm (X - 0.08)，高度稍微高出 1.5cm (Z + 0.015) 以便下壓
-        x_aim = x_target - 0.08
-        z_aim = z_target + 0.015
-        print(f"[State 4] 手臂瞄準點: X={x_aim:.3f}m, Z={z_aim:.3f}m")
+        # 目標點：門把正上方 5cm（z + 0.05），x 對齊門把
+        x_above = x_target
+        z_above = z_target + PRESS_ABOVE_OFFSET
+        print(f"[State 4] 移到正上方: X={x_above:.3f}m, Z={z_above:.3f}m")
 
         try:
-            self.arm.move_to_2d_position(x_aim, z_aim, step=3.0, delay=0.05)
-            print("[State 4] 手臂瞄準完成")
-            self._transition(DoorOpenState.ARM_APPROACH)
+            self.arm.move_to_2d_position(x_above, z_above, step=3.0, delay=0.05)
+            # 儲存基準座標，讓下壓使用
+            self._last_knob_x = x_target
+            self._last_knob_z = z_target
+            print("[State 4] 手臂已到達門把正上方，準備下壓")
+            self._transition(DoorOpenState.PRESS_DOWN)
         except Exception as e:
-            print(f"[State 4] 2D IK 計算失敗: {e}")
+            print(f"[State 4] 移動失敗: {e}")
             self._transition(DoorOpenState.ERROR)
-            
+
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 5：手臂 2D 前伸至門把位置
+    # State 5（已移除）：ARM_APPROACH — 本策略不再從側面伸入，由 step() 跳過
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_arm_approach(self):
-        print("[State 5] 2D 手臂前伸觸碰門把…")
-        coords = self.arm.get_target_relative_coords()
-        if coords is None:
-            print("[State 5] 失去門把座標，使用前一次的位置前進...")
-            self._transition(DoorOpenState.PRESS_DOWN)
-            return False
-
-        x_target, z_target = coords
-        # 前進到門把正上方
-        x_reach = x_target
-        z_reach = z_target + 0.01  # 稍微在門把正上方/正前方
-
-        print(f"[State 5] 伸向門把位置: X={x_reach:.3f}m, Z={z_reach:.3f}m")
-        try:
-            self.arm.move_to_2d_position(x_reach, z_reach, step=3.0, delay=0.05)
-            print("[State 5] 手臂已到達門把位置")
-            self._transition(DoorOpenState.PRESS_DOWN)
-        except Exception as e:
-            print(f"[State 5] 2D IK 前伸失敗: {e}")
-            self._transition(DoorOpenState.ERROR)
-            
+        # 策略已改為「正上方壓下」，此狀態不會被使用，直接跳到 PRESS_DOWN
+        self._transition(DoorOpenState.PRESS_DOWN)
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # State 6：向下壓門把 (2D 下壓)
+    # State 6：夾爪合起 → 直接往下壓
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_press_down(self):
         if self._press_count == 0:
-            print("[State 6] 觸碰完成，夾緊夾爪（20度）咬住門把…")
-            self.arm.set_last_joint_angle(20.0)   # 2D 夾爪夾緊為 20度
-            time.sleep(1.0)                       # 等待夾爪咬合完成
-            
-            # 獲取當前相對座標作為基準
-            coords = self.arm.get_target_relative_coords()
-            if coords is not None:
-                self._last_knob_x, self._last_knob_z = coords
-            else:
-                # 備用值
-                self._last_knob_x, self._last_knob_z = 0.4, 0.0
+            print("[State 5] 夾爪合起，壓住門把…")
+            self.arm.set_last_joint_angle(20.0)   # 夾爪合攏（20度）
+            time.sleep(0.8)                       # 等待夾爪咬合
 
-            print(f"[State 6] 開始向下壓門把，基準: X={self._last_knob_x:.3f}m, Z={self._last_knob_z:.3f}m")
-            
-            # 下壓目標：Z 軸向下減少 7cm
-            x_press = self._last_knob_x
-            z_press = self._last_knob_z - 0.07
-            
+            print(f"[State 5] 往下壓 {PRESS_Z_DOWN * 100:.1f}cm，目標: X={self._last_knob_x:.3f}m, Z={self._last_knob_z - PRESS_Z_DOWN:.3f}m")
+
             try:
-                self.arm.move_to_2d_position(x_press, z_press, step=3.0, delay=0.05)
-                print("[State 6] 門把已壓下")
+                # 直接一步壓到目標高度
+                self.arm.move_to_2d_position(
+                    self._last_knob_x,
+                    self._last_knob_z - PRESS_Z_DOWN,
+                    step=2.0,
+                    delay=0.05,
+                )
+                print("[State 5] 門把已壓下")
                 time.sleep(0.5)
                 self._transition(DoorOpenState.OPEN_DOOR)
             except Exception as e:
-                print(f"[State 6] 下壓 2D IK 失敗: {e}")
+                print(f"[State 5] 下壓失敗: {e}")
                 self._transition(DoorOpenState.ERROR)
-            
+
             self._press_count = 1
-            
+
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
