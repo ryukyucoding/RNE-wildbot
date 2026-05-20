@@ -266,8 +266,16 @@ class DoorOpenTask:
         if yolo is None or yolo[0] == 0:
             self._align_lost += 1
             if self._align_lost <= ALIGN_PATIENCE:
-                # 暫停旋轉，等待 YOLO 重新偵測
-                self.car.update_action("STOP")
+                # 根據地圖座標，主動轉回去找 knob（而非停下來乾等）
+                action = self._heading_to_last_knob()
+                if action and action != "FORWARD_SLOW":
+                    # 用地圖方位判斷應往哪個方向旋轉
+                    self.car.update_action(action)
+                    if self._align_lost == 1:
+                        print(f"[State 2] YOLO 暫時丟失，根據地圖座標轉回去找 ({ALIGN_PATIENCE * 0.1:.0f}s 耐心)")
+                else:
+                    # 沒有地圖座標或已對齊 → 先停一下
+                    self.car.update_action("STOP")
                 time.sleep(0.1)
                 return False
             # 耐心耗盡 → 回到搜尋
