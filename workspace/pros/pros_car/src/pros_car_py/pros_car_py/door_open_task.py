@@ -222,6 +222,48 @@ class DoorOpenTask:
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
+    # 工具：記錄 knob 在地圖上的世界座標（每次 YOLO 偵測到時呼叫）
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _save_knob_map_pos(self, depth):
+        """用 AMCL 位姿 + YOLO 深度，估算 knob 在地圖上的 (x, y)。"""
+        try:
+            pose, quat = self.dp.get_processed_amcl_pose()
+            robot_x, robot_y = pose[0], pose[1]
+            # 從四元數取得 yaw（車子朝向）
+            yaw = math.atan2(
+                2 * (quat[3] * quat[2] + quat[0] * quat[1]),
+                1 - 2 * (quat[1] ** 2 + quat[2] ** 2),
+            )
+            self._last_knob_map_pos = (
+                robot_x + depth * math.cos(yaw),
+                robot_y + depth * math.sin(yaw),
+            )
+        except Exception:
+            pass   # AMCL 還沒就緒時忽略
+
+    def _heading_to_last_knob(self):
+        """根據上次記錄的 knob 地圖座標，回傳車子應轉向的動作指令。
+        回傳 'CLOCKWISE_ROTATION_SLOW' / 'COUNTERCLOCKWISE_ROTATION_SLOW' / 'FORWARD_SLOW' / None。"""
+        if self._last_knob_map_pos is None:
+            return None
+        try:
+            pose, quat = self.dp.get_processed_amcl_pose()
+            robot_x, robot_y = pose[0], pose[1]
+            yaw = math.atan2(
+                2 * (quat[3] * quat[2] + quat[0] * quat[1]),
+                1 - 2 * (quat[1] ** 2 + quat[2] ** 2),
+            )
+            target_x, target_y = self._last_knob_map_pos
+            desired_yaw = math.atan2(target_y - robot_y, target_x - robot_x)
+            diff = (desired_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(diff) < 0.3:   # 約 17° 以內視為已對齊
+                return "FORWARD_SLOW"
+            return "CLOCKWISE_ROTATION_SLOW" if diff > 0 else "COUNTERCLOCKWISE_ROTATION_SLOW"
+        except Exception:
+            return None
+
+    # ──────────────────────────────────────────────────────────────────────────
     # State 1：原地旋轉搜尋門把
     # ──────────────────────────────────────────────────────────────────────────
 
