@@ -227,6 +227,9 @@ class DoorOpenTask:
 
     def _save_knob_map_pos(self, depth):
         """用 AMCL 位姿 + YOLO 深度，估算 knob 在地圖上的 (x, y)。"""
+        # 直接從 rc 檢查是否已收到 AMCL 資料，避免呼叫 getter 觸發大量的警告 Log
+        if self.rc.latest_amcl_pose is None:
+            return
         try:
             pose, quat = self.dp.get_processed_amcl_pose()
             robot_x, robot_y = pose[0], pose[1]
@@ -245,7 +248,7 @@ class DoorOpenTask:
     def _heading_to_last_knob(self):
         """根據上次記錄的 knob 地圖座標，回傳車子應轉向的動作指令。
         回傳 'CLOCKWISE_ROTATION_SLOW' / 'COUNTERCLOCKWISE_ROTATION_SLOW' / 'FORWARD_SLOW' / None。"""
-        if self._last_knob_map_pos is None:
+        if self._last_knob_map_pos is None or self.rc.latest_amcl_pose is None:
             return None
         try:
             pose, quat = self.dp.get_processed_amcl_pose()
@@ -262,6 +265,7 @@ class DoorOpenTask:
             return "CLOCKWISE_ROTATION_SLOW" if diff > 0 else "COUNTERCLOCKWISE_ROTATION_SLOW"
         except Exception:
             return None
+
 
     # ──────────────────────────────────────────────────────────────────────────
     # State 1：原地旋轉搜尋門把
