@@ -86,7 +86,7 @@ PRESS_Z_DOWN = 0.07              # 7cm
 # State 6：開門的車輛動作與時間
 # 如果是要往外拉門，請填 "BACKWARD_SLOW"
 # 如果是要往內推門，請填 "FORWARD_SLOW"
-DOOR_OPEN_ACTION = "BACKWARD_SLOW"
+DOOR_OPEN_ACTION = "FORWARD_SLOW"
 OPEN_DOOR_DURATION = 2.5         # 秒
 
 # ─────────────────────────────────────────────────────────────────────────────
