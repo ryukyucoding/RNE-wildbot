@@ -203,14 +203,13 @@ class DoorOpenTask:
 
         # ── 任務起始：先把手臂舉到最高安全位置 ──────────────────────────────
         # 讓 Shoulder 盡量往上收（-180°），Elbow 打直（0°），夾爪張開（90°）
-        # 這樣在搜尋、對齊、前進的過程中手臂不會卡到任何東西
+        # 為了避免 ROS 2 node 剛啟動時 publisher 遺失第一個封包，我們連發幾次
         print("[DoorOpenTask] 手臂舉到最高，準備執行任務…")
         try:
-            self.arm.joint_angles[0] = -180.0  # Shoulder 最高位置
-            self.arm.joint_angles[1] = 0.0     # Elbow 打直
-            self.arm.joint_angles[2] = 90.0    # Gripper 張開
-            self.arm._clamp_and_publish()
-            time.sleep(1.0)   # 等手臂確實到位
+            self.arm.joint_angles = [-180.0, 0.0, 90.0]
+            for _ in range(5):
+                self.arm._clamp_and_publish()
+                time.sleep(0.2)
         except Exception as e:
             print(f"[DoorOpenTask] 手臂初始化警告（忽略）: {e}")
         # ──────────────────────────────────────────────────────────────────────
