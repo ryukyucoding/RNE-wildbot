@@ -68,6 +68,10 @@ DEPTH_EMA_ALPHA = 0.3
 # FORWARD_SLOW 約為 0.1 m/s → 0.15s ≈ 1.5cm，依實際速度調整。
 CREEP_DURATION = 1.5               # 停車後繼續盲爬的秒數（調大 = 靠更近）
 
+# State 4：手臂可抵達的最大水平距離（保守估計，公尺）
+# 實體手臂總長 ~19cm，設定略保守的 17cm
+ARM_MAX_REACH = 0.17
+
 # State 4：手臂先移到門把「正上方」的偏移量（公尺）
 # 夾爪張開後，末端停在門把上方 5cm
 PRESS_ABOVE_OFFSET = 0.05        # 5cm
@@ -301,7 +305,7 @@ class DoorOpenTask:
             print("[State 1] 搜尋逾時，任務失敗")
             self._transition(DoorOpenState.ERROR)
 
-        time.sleep(0.1)
+        time.sleep(0.05)  # 讓出 CPU，避免忙等待（run_blocking 的 spin_interval 控制主節奏）
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -331,7 +335,6 @@ class DoorOpenTask:
                 else:
                     # 沒有地圖座標 → 維持上次轉向動作不變（不停車！）
                     self.car.update_action(self._last_align_action)
-                time.sleep(0.1)
                 return False
             # 耐心耗盡
             print(f"[State 2] 目標丟失超過 {ALIGN_PATIENCE_SECS}s，回到搜尋")
@@ -371,7 +374,6 @@ class DoorOpenTask:
             print("[State 2] 對齊逾時，任務失敗")
             self._transition(DoorOpenState.ERROR)
 
-        time.sleep(0.1)
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -462,7 +464,6 @@ class DoorOpenTask:
         self.car.update_action(self._last_drive_action)
 
         self._iter += 1
-        time.sleep(0.1)
         return False
 
 
@@ -471,44 +472,50 @@ class DoorOpenTask:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _state_arm_aim(self):
-        print("[State 4] 夾爪張開，手臂移到門把正上方…")
+        if self._iter == 0:
+            print("[State 4] 夾爪張開，持續靠近到手臂可達範圍…")
+            self.arm.set_last_joint_angle(90.0)
+            self._arm_approach_start = time.time()
+            self._iter = 1
 
-        # 先張開夾爪
-        self.arm.set_last_joint_angle(90.0)
-        time.sleep(0.3)
+        # 更新 EMA 深度
+        yolo = self.dp.get_yolo_target_info()
+        if yolo and yolo[0] == 1 and yolo[1] > 0:
+            d = yolo[1]
+            if self._depth_ema is None:
+                self._depth_ema = d
+            else:
+                self._depth_ema = DEPTH_EMA_ALPHA * d + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
 
-        # ── 盲爬階段：用 State 3 停車時記錄的深度 ──────────────────────────
-        # 由於停車距離（DRIVE_STOP_DEPTH）仍超過手臂可達範圍，
-        # 在這裡讓車子再向前盲爬 CREEP_DURATION 秒，讓手臂能構到門把。
-        # 車子盲爬中 YOLO 可能看不到，完全正常。
-        saved_depth = getattr(self, '_last_knob_depth', None)
-        if saved_depth is None:
-            # 安全備援：直接再讀一次
-            yolo_fb = self.dp.get_yolo_target_info()
-            saved_depth = yolo_fb[1] if (yolo_fb and yolo_fb[0] == 1) else 0.40
+        check_depth = self._depth_ema or self._last_knob_depth or 0.40
+        arm_x = check_depth + CAMERA_X_OFFSET
+        elapsed = time.time() - self._arm_approach_start
 
-        print(f"[State 4] 盲爬前記錄深度={saved_depth:.3f}m，開始向前盲爬 {CREEP_DURATION}s…")
-        self.car.update_action("FORWARD_SLOW")
-        time.sleep(CREEP_DURATION)
+        # 從 State 3 指令動作絶對不停車，讓車子持續前進直到手臂能構到
+        if arm_x > ARM_MAX_REACH and elapsed < 10.0:
+            self.car.update_action("FORWARD_SLOW")
+            if self._iter % 20 == 0:
+                print(f"[State 4] 持續靠近… EMA depth={check_depth:.3f}m, arm_x={arm_x:.3f}m")
+            self._iter += 1
+            return False
+
+        # 手臂可構到！停車再動手臂
         self.car.update_action("STOP")
         time.sleep(0.3)
-        # ── 盲爬結束 ────────────────────────────────────────────────────────
 
-        # 利用停車時的深度（非盲爬後）計算手臂目標座標
-        # 盲爬的距離由 CREEP_DURATION × 車速 估算，直接合入 CAMERA_X_OFFSET 補償
-        x_target = saved_depth + CAMERA_X_OFFSET
+        if elapsed >= 10.0:
+            print(f"[State 4] 靠近逾時，強制在當前位置就地計算 arm_x={arm_x:.3f}m")
+        else:
+            print(f"[State 4] 手臂可達！EMA depth={check_depth:.3f}m, arm_x={arm_x:.3f}m")
+
+        x_target = arm_x
         z_target = KNOB_Z_HEIGHT
-
-        print(f"[State 4] 計算出門把相對於手臂座標: X={x_target:.3f}m, Z={z_target:.3f}m")
-
-        # 目標點：門把正上方 5cm（z + 0.05），x 對齊門把
-        x_above = x_target
-        z_above = z_target + PRESS_ABOVE_OFFSET
+        x_above  = x_target
+        z_above  = z_target + PRESS_ABOVE_OFFSET
         print(f"[State 4] 移到正上方: X={x_above:.3f}m, Z={z_above:.3f}m")
 
         try:
             self.arm.move_to_2d_position(x_above, z_above, step=3.0, delay=0.05)
-            # 儲存基準座標，讓下壓使用
             self._last_knob_x = x_target
             self._last_knob_z = z_target
             print("[State 4] 手臂已到達門把正上方，準備下壓")
@@ -648,7 +655,7 @@ def main():
     )
 
     try:
-        task.run_blocking(spin_interval=0.1)
+        task.run_blocking(spin_interval=0.05)  # 20Hz FSM 更新率，確保馬達指令連續
     except KeyboardInterrupt:
         print("[main] 中斷，停車")
         car_controller.update_action("STOP")
