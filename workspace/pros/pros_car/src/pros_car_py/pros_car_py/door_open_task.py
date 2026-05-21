@@ -42,31 +42,23 @@ YOLO_TARGET_LABEL = "knob"
 # 設為 600（60秒）以確保車子有足夠時間至少原地旋轉滿一整圈（360度）
 SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 
-# State 2：對齊門把的像素容差（畫面寬度約 640px，小於此值視為置中）
-ALIGN_PIXEL_TOL = 60             # px
+# ── Visual Servoing (PID) 參數 ────────────────────────────────────────────────
+# 基礎前進速度（rad/s，對應輪胎轉速）
+# 根據你的 ACTION_MAPPINGS，FORWARD_SLOW 的速度大約是 150 (3.0 * 50)
+VS_BASE_SPEED = 120.0
+# 轉向 PID 控制器參數：根據 pixel_offset 計算左右輪速差
+VS_KP_STEER = 0.5           # 比例係數 (例如 offset=50px -> 轉速差=25)
+VS_MAX_STEER = 100.0        # 最大轉速差限制
 
-# State 2：YOLO 丟失時的耐心（秒）。在此期間根據地圖座標繼續轉向，不回 State 1。
-ALIGN_PATIENCE_SECS = 5.0       # 5 秒
+# State 2：YOLO 丟失時的耐心（秒）。丟失後維持目前速度，不直接停車。
+VS_PATIENCE_SECS = 3.0      
 
-# State 3：YOLO 丟失時的耐心（秒）。丟失後繼續直行不停車。
-DRIVE_PATIENCE_SECS = 5.0       # 5 秒
-
-# State 3：車子前進靠近門的停止深度（公尺）
-DRIVE_STOP_DEPTH = 0.40         # 距門把 0.40m 內停車
-
-# State 3：逾時秒數（避免無限前進）
-DRIVE_MAX_SECS = 30.0           # 最多前進 30 秒
-
-# State 3：連續幾次有效近距讀數才停車（防止深度感測器噪訊）
-DRIVE_NEAR_COUNT = 5            # 連續 5 次 (≈0.5 秒)
+# State 2：Visual Servoing 的停車條件
+# 當 LiDAR 測量到門面小於等於這個距離，或者 YOLO depth 小於等於這個距離時停車
+VS_STOP_DISTANCE = 0.25     # 0.25m 停車 (讓手臂剛剛好夠得到)
 
 # 深度 EMA 平滑係數（0~1，越小越平滑，越大越即時）
 DEPTH_EMA_ALPHA = 0.3
-
-# State 3→4 盲爬補償：停車後，因此距離手臂仍構不到，
-# 所以在 State 4 開始時，讓車子多向前盲爬一小段固定時間（秒）。
-# FORWARD_SLOW 約為 0.1 m/s → 0.15s ≈ 1.5cm，依實際速度調整。
-CREEP_DURATION = 1.5               # 停車後繼續盲爬的秒數（調大 = 靠更近）
 
 # State 4：手臂可抵達的最大水平距離（保守估計，公尺）
 # 實體手臂總長 ~19cm，設定略保守的 17cm
@@ -99,17 +91,15 @@ OPEN_DOOR_DURATION = 2.5         # 秒
 
 
 class DoorOpenState:
-    """枚舉各狀態"""
-    NAVIGATE_TO_DOOR = 0
-    SEARCH_HANDLE    = 1
-    ALIGN_CAR        = 2
-    DRIVE_TO_DOOR    = 3   # ← 新增：視覺對齊後開車靠近門
-    ARM_AIM          = 4
-    ARM_APPROACH     = 5
-    PRESS_DOWN       = 6
-    OPEN_DOOR        = 7
-    DONE             = 8
-    ERROR            = 99
+    """枚舉各狀態（重構為連續視覺伺服）"""
+    NAVIGATE_TO_DOOR       = 0
+    SEARCH_HANDLE          = 1
+    VISUAL_SERVO_APPROACH  = 2   # ← 取代舊的 ALIGN_CAR 和 DRIVE_TO_DOOR
+    ARM_AIM                = 4
+    PRESS_DOWN             = 6
+    OPEN_DOOR              = 7
+    DONE                   = 8
+    ERROR                  = 99
 
 
 class DoorOpenTask:
@@ -153,10 +143,9 @@ class DoorOpenTask:
         self._last_knob_depth = None   # State 3 停車時的 YOLO 深度備份
         self._last_knob_map_pos = None # 最後一次偵測到 knob 的地圖座標 (x, y)
         self._depth_ema = None         # 深度 EMA 平滑值
-        # 時間戳記型的丟失追蹤（取代幀計數）
-        self._align_lost_since = None  # State 2 丟失起始時間
-        self._drive_lost_since = None  # State 3 丟失起始時間
-        self._last_drive_action = "FORWARD_SLOW"  # 記憶上次前進指令（防走走停停）
+        # 時間戳記型的丟失追蹤
+        self._vs_lost_since = None
+        self._last_vs_velocities = [0.0, 0.0, 0.0, 0.0]  # [RL, RR, FL, FR]
 
     # ──────────────────────────────────────────────────────────────────────────
     # 主要介面
@@ -174,14 +163,10 @@ class DoorOpenTask:
             return self._state_navigate()
         elif self.state == DoorOpenState.SEARCH_HANDLE:
             return self._state_search()
-        elif self.state == DoorOpenState.ALIGN_CAR:
-            return self._state_align_car()
-        elif self.state == DoorOpenState.DRIVE_TO_DOOR:
-            return self._state_drive_to_door()
+        elif self.state == DoorOpenState.VISUAL_SERVO_APPROACH:
+            return self._state_visual_servo_approach()
         elif self.state == DoorOpenState.ARM_AIM:
             return self._state_arm_aim()
-        elif self.state == DoorOpenState.ARM_APPROACH:
-            return self._state_arm_approach()
         elif self.state == DoorOpenState.PRESS_DOWN:
             return self._state_press_down()
         elif self.state == DoorOpenState.OPEN_DOOR:
@@ -322,160 +307,93 @@ class DoorOpenTask:
         time.sleep(0.05)  # 讓出 CPU，避免忙等待（run_blocking 的 spin_interval 控制主節奏）
         return False
 
+    def _get_front_lidar_min(self):
+        """獲取正前方 LiDAR 最小距離（避障與測距防備）"""
+        try:
+            lidar_msg = self.rc.latest_lidar
+            if not lidar_msg: return None
+            ranges = lidar_msg.ranges
+            n = len(ranges)
+            if n == 0: return None
+            # 取正前方約 30 度角 (15度 ~ -15度)
+            cone = max(1, int(n * (30.0 / 360.0) / 2))
+            front = ranges[:cone] + ranges[-cone:]
+            valid = [r for r in front if 0.1 < r < 4.0]  # 濾除 0 或過遠噪訊
+            if valid:
+                return min(valid)
+        except Exception:
+            pass
+        return None
+
     # ──────────────────────────────────────────────────────────────────────────
-    # State 2：車身水平對齊門把（利用 YOLO pixel offset）
+    # State 2：Visual Servoing (PID) 閉迴路控制靠近
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _state_align_car(self):
+    def _state_visual_servo_approach(self):
         if self._iter == 0:
-            print("[State 2] 水平對齊門把…")
-            self._last_align_action = "STOP"
+            print(f"[State 2] 開始 Visual Servoing 靠近門把… 目標距離={VS_STOP_DISTANCE}m")
+            self._last_vs_velocities = [0.0, 0.0, 0.0, 0.0]
+            self._vs_lost_since = None
 
         yolo = self.dp.get_yolo_target_info()
+        lidar_dist = self._get_front_lidar_min()
 
-        if yolo is None or yolo[0] == 0:
-            # ── YOLO 丟失：不停車，根據地圖或慣性繼續動作 ──
-            if self._align_lost_since is None:
-                self._align_lost_since = time.time()
-                print(f"[State 2] YOLO 暫時丟失，維持動作中 ({ALIGN_PATIENCE_SECS}s 耐心)")
-
-            lost_dur = time.time() - self._align_lost_since
-
-            if lost_dur < ALIGN_PATIENCE_SECS:
-                # 耐心期內：用地圖朝向繼續轉，或維持上次動作
-                action = self._heading_to_last_knob()
-                if action and action != "FORWARD_SLOW":
-                    self.car.update_action(action)
-                else:
-                    # 沒有地圖座標 → 維持上次轉向動作不變（不停車！）
-                    self.car.update_action(self._last_align_action)
-                return False
-            # 耐心耗盡
-            print(f"[State 2] 目標丟失超過 {ALIGN_PATIENCE_SECS}s，回到搜尋")
-            self._align_lost_since = None
-            self.car.update_action("STOP")
-            self._transition(DoorOpenState.SEARCH_HANDLE)
-            return False
-
-        # ── YOLO 偵測到 → 重置丟失、更新地圖座標 ──
-        self._align_lost_since = None
-        depth = yolo[1]
-        if depth > 0:
-            self._save_knob_map_pos(depth)
-            # 更新 EMA 深度
-            if self._depth_ema is None:
-                self._depth_ema = depth
-            else:
-                self._depth_ema = DEPTH_EMA_ALPHA * depth + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
-
-        pixel_offset = yolo[2]
-
-        if abs(pixel_offset) <= ALIGN_PIXEL_TOL:
-            print(f"[State 2] 對齊完成（offset={pixel_offset:.1f}px），開始前進靠近門")
-            # 不停車！直接切換到前進狀態，讓動作連貫
-            self._transition(DoorOpenState.DRIVE_TO_DOOR)
-            return False
-
-        # 根據偏移方向旋轉
-        if pixel_offset > 0:
-            self._last_align_action = "CLOCKWISE_ROTATION_SLOW"
-        else:
-            self._last_align_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
-        self.car.update_action(self._last_align_action)
-
-        self._iter += 1
-        if self._iter > SEARCH_MAX_ITER:
-            print("[State 2] 對齊逾時，任務失敗")
-            self._transition(DoorOpenState.ERROR)
-
-        return False
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # State 3：前進靠近門，直到 YOLO 深度 < DRIVE_STOP_DEPTH
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _state_drive_to_door(self):
-        if self._iter == 0:
-            print(f"[State 3] 前進靠近門把，目標距離 < {DRIVE_STOP_DEPTH}m…")
-            self._drive_start = time.time()
-            self._drive_near_count = 0
-
-        yolo = self.dp.get_yolo_target_info()
-
-        if yolo is None or yolo[0] == 0:
-            # ── YOLO 丟失：不停車，維持上次前進動作 ──
-            if self._drive_lost_since is None:
-                self._drive_lost_since = time.time()
-                print(f"[State 3] YOLO 暫時丟失，維持前進中 ({DRIVE_PATIENCE_SECS}s 耐心)")
-
-            lost_dur = time.time() - self._drive_lost_since
-
-            if lost_dur < DRIVE_PATIENCE_SECS:
-                # 耐心期：用地圖方向或維持上次動作繼續前進
-                action = self._heading_to_last_knob()
-                if action:
-                    self.car.update_action(action)
-                else:
-                    self.car.update_action(self._last_drive_action)
-                self._iter += 1
-                time.sleep(0.1)
-                return False
-            # 耐心耗盡
-            print(f"[State 3] 目標持續丟失超過 {DRIVE_PATIENCE_SECS}s，停車回到搜尋")
-            self._drive_lost_since = None
-            self.car.update_action("STOP")
-            self._transition(DoorOpenState.SEARCH_HANDLE)
-            return False
-
-        # ── YOLO 偵測到 → 重置丟失、更新地圖座標與 EMA 深度 ──
-        self._drive_lost_since = None
-        depth = yolo[1]
-        pixel_offset = yolo[2]
-
-        if depth > 0:
-            self._save_knob_map_pos(depth)
-            if self._depth_ema is None:
-                self._depth_ema = depth
-            else:
-                self._depth_ema = DEPTH_EMA_ALPHA * depth + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
-
-        # ── 用 EMA 深度判斷是否夠近（比原始 depth 更穩定）──
-        check_depth = self._depth_ema if self._depth_ema else depth
-
-        if check_depth <= 0:
-            self._drive_near_count = 0
-        elif check_depth < DRIVE_STOP_DEPTH:
-            self._drive_near_count += 1
-            if self._drive_near_count == 1:
-                print(f"[State 3] 靠近中… EMA depth={check_depth:.3f}m (確認中…)")
-            if self._drive_near_count >= DRIVE_NEAR_COUNT:
-                print(f"[State 3] 確認靠近門把（EMA depth={check_depth:.3f}m），停車")
-                self._last_knob_depth = check_depth
-                self.car.update_action("STOP")
-                self._transition(DoorOpenState.ARM_AIM)
-                return False
-        else:
-            self._drive_near_count = 0
-
-        # 逾時強制繼續
-        elapsed = time.time() - getattr(self, '_drive_start', time.time())
-        if elapsed > DRIVE_MAX_SECS:
-            saved = check_depth if (check_depth and check_depth > 0) else DRIVE_STOP_DEPTH
-            print(f"[State 3] 前進逾時 ({elapsed:.1f}s)，強制繼續（EMA depth={saved:.3f}m）")
-            self._last_knob_depth = saved
+        # ── 1. 檢查停止條件 (優先信任 LiDAR) ──
+        if lidar_dist and lidar_dist <= VS_STOP_DISTANCE:
+            print(f"[State 2] LiDAR 觸發停車條件！距離={lidar_dist:.3f}m")
+            self._last_knob_depth = lidar_dist
             self.car.update_action("STOP")
             self._transition(DoorOpenState.ARM_AIM)
             return False
 
-        # ── 前進：根據 pixel offset 微調方向 ──
-        if abs(pixel_offset) > ALIGN_PIXEL_TOL * 2:
-            if pixel_offset > 0:
-                self._last_drive_action = "RIGHT_FRONT"
+        if yolo and yolo[0] == 1 and yolo[1] > 0:
+            d = yolo[1]
+            if self._depth_ema is None:
+                self._depth_ema = d
             else:
-                self._last_drive_action = "LEFT_FRONT"
-        else:
-            self._last_drive_action = "FORWARD_SLOW"
-        self.car.update_action(self._last_drive_action)
+                self._depth_ema = DEPTH_EMA_ALPHA * d + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
+            
+            if self._depth_ema <= VS_STOP_DISTANCE:
+                print(f"[State 2] YOLO 深度觸發停車條件！EMA={self._depth_ema:.3f}m")
+                self._last_knob_depth = self._depth_ema
+                self.car.update_action("STOP")
+                self._transition(DoorOpenState.ARM_AIM)
+                return False
+
+        # ── 2. YOLO 目標遺失處理 ──
+        if yolo is None or yolo[0] == 0:
+            if self._vs_lost_since is None:
+                self._vs_lost_since = time.time()
+                print(f"[State 2] YOLO 暫時丟失，維持當前速度中 ({VS_PATIENCE_SECS}s 耐心)")
+
+            lost_dur = time.time() - self._vs_lost_since
+            if lost_dur < VS_PATIENCE_SECS:
+                self.rc.publish_raw_car_control(self._last_vs_velocities)
+                self._iter += 1
+                return False
+            
+            print(f"[State 2] 目標持續丟失超過 {VS_PATIENCE_SECS}s，退回搜尋狀態")
+            self._vs_lost_since = None
+            self.car.update_action("STOP")
+            self._transition(DoorOpenState.SEARCH_HANDLE)
+            return False
+
+        # ── 3. YOLO 正常偵測，執行 PID 控制 ──
+        self._vs_lost_since = None
+        pixel_offset = yolo[2]
+
+        steer_output = VS_KP_STEER * pixel_offset
+        steer_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, steer_output))
+
+        v_left  = VS_BASE_SPEED + steer_output
+        v_right = VS_BASE_SPEED - steer_output
+
+        velocities = [v_left, v_right, v_left, v_right]
+        self.rc.publish_raw_car_control(velocities)
+        self._last_vs_velocities = velocities
+
+        if self._iter % 20 == 0:
+            print(f"[VS] offset={pixel_offset:.1f}px, steer={steer_output:.1f}, L={v_left:.0f}, R={v_right:.0f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
 
         self._iter += 1
         return False
@@ -487,49 +405,19 @@ class DoorOpenTask:
 
     def _state_arm_aim(self):
         if self._iter == 0:
-            print("[State 4] 夾爪張開，持續靠近到手臂可達範圍…")
+            print("[State 4] 夾爪張開，準備移動手臂…")
             self.arm.set_last_joint_angle(90.0)
-            self._arm_approach_start = time.time()
             self._iter = 1
+            time.sleep(0.3)
 
-        # 更新 EMA 深度
-        yolo = self.dp.get_yolo_target_info()
-        if yolo and yolo[0] == 1 and yolo[1] > 0:
-            d = yolo[1]
-            if self._depth_ema is None:
-                self._depth_ema = d
-            else:
-                self._depth_ema = DEPTH_EMA_ALPHA * d + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
-
-        # YOLO 深度 (可能無效)
-        check_depth = self._depth_ema or self._last_knob_depth or 0.40
+        # 車子在 State 2 已經因為 LiDAR 或 YOLO 深度達到 VS_STOP_DISTANCE (0.25m) 而精準停車。
+        # 所以 arm_x = VS_STOP_DISTANCE + CAMERA_X_OFFSET = 0.25 + (-0.15) = 0.10m
+        # 0.10m 完美落在 ARM_MAX_REACH (0.17m) 內，絕不超距！
         
-        # 輔助：LiDAR 測距
-        lidar_dist = self._get_front_lidar_min()
-        if lidar_dist and lidar_dist < check_depth:
-            # LiDAR 是測量門面，門把通常凸出門面幾公分，所以距離門把實際上會更近
-            # 但這裡保險起見，至少採信較小的值，防止撞門
-            check_depth = lidar_dist
-
+        check_depth = self._last_knob_depth if self._last_knob_depth else VS_STOP_DISTANCE
         arm_x = check_depth + CAMERA_X_OFFSET
-        elapsed = time.time() - self._arm_approach_start
-
-        # 從 State 3 指令動作絶對不停車，讓車子持續前進直到手臂能構到
-        if arm_x > ARM_MAX_REACH and elapsed < 10.0:
-            self.car.update_action("FORWARD_SLOW")
-            if self._iter % 20 == 0:
-                print(f"[State 4] 持續靠近… depth={check_depth:.3f}m, arm_x={arm_x:.3f}m (LiDAR={lidar_dist if lidar_dist else 0:.3f}m)")
-            self._iter += 1
-            return False
-
-        # 手臂可構到！停車再動手臂
-        self.car.update_action("STOP")
-        time.sleep(0.3)
-
-        if elapsed >= 10.0:
-            print(f"[State 4] 靠近逾時，強制在當前位置就地計算 arm_x={arm_x:.3f}m")
-        else:
-            print(f"[State 4] 手臂可達！距離={check_depth:.3f}m, arm_x={arm_x:.3f}m")
+        
+        print(f"[State 4] 手臂可達！門距離={check_depth:.3f}m, 手臂目標X={arm_x:.3f}m")
 
         x_target = arm_x
         z_target = KNOB_Z_HEIGHT
