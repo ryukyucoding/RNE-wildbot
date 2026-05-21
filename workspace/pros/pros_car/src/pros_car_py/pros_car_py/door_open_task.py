@@ -63,6 +63,13 @@ VS_PATIENCE_SECS = 3.0
 # 當 LiDAR 測量到門面小於等於這個距離，或者 YOLO depth 小於等於這個距離時停車
 VS_STOP_DISTANCE = 0.30     # 0.30m 停車 (離門把更安全且剛好夠得到)
 
+# ── 兩階段停車：精對齊 (Fine Alignment) 參數 ─────────────────────────────────
+# 車子到達停車距離後，會先原地旋轉直到門把在畫面中心（誤差 < 容差），才進入手臂動作。
+# 這樣不管從哪個角度靠近，都能確保手臂正對門把。
+VS_ALIGN_PIXEL_TOL = 20.0   # 允許的像素誤差（±20px 內視為對齊）
+VS_ALIGN_KP = 0.3            # 精對齊時的純旋轉 PID 比例係數（比靠近時保守，避免震盪）
+VS_ALIGN_TIMEOUT = 5.0       # 精對齊最長等待時間（秒），超時則直接進入手臂動作
+
 # 深度 EMA 平滑係數（0~1，越小越平滑，越大越即時）
 DEPTH_EMA_ALPHA = 0.3
 
@@ -151,6 +158,7 @@ class DoorOpenTask:
         self._depth_ema = None         # 深度 EMA 平滑值
         # 時間戳記型的丟失追蹤
         self._vs_lost_since = None
+        self._fine_align_since = None     # State 2 精對齊階段的開始時間戳記
         self._last_vs_velocities = [0.0, 0.0, 0.0, 0.0]  # [RL, RR, FL, FR]
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -340,57 +348,79 @@ class DoorOpenTask:
             print(f"[State 2] 開始 Visual Servoing 靠近門把… 目標距離={VS_STOP_DISTANCE}m")
             self._last_vs_velocities = [0.0, 0.0, 0.0, 0.0]
             self._vs_lost_since = None
+            self._fine_align_since = None   # 精對齊開始時間（None = 尚在靠近階段）
 
         yolo = self.dp.get_yolo_target_info()
         lidar_dist = self._get_front_lidar_min()
 
-        # ── 1. 檢查停止條件 (優先信任 LiDAR) ──
-        if lidar_dist and lidar_dist <= VS_STOP_DISTANCE:
-            print(f"[State 2] LiDAR 觸發停車條件！距離={lidar_dist:.3f}m")
-            self._last_knob_depth = lidar_dist
-            self.car.update_action("STOP")
-            self._transition(DoorOpenState.ARM_AIM)
-            return False
-
-        if yolo and yolo[0] == 1 and yolo[1] > 0:
-            d = yolo[1]
-            if self._depth_ema is None:
-                self._depth_ema = d
-            else:
-                self._depth_ema = DEPTH_EMA_ALPHA * d + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
-            
-            if self._depth_ema <= VS_STOP_DISTANCE:
-                print(f"[State 2] YOLO 深度觸發停車條件！EMA={self._depth_ema:.3f}m")
-                self._last_knob_depth = self._depth_ema
-                self.car.update_action("STOP")
-                self._transition(DoorOpenState.ARM_AIM)
-                return False
-
-        # ── 2. YOLO 目標遺失處理 ──
+        # ── YOLO 遺失統一處理 ──
         if yolo is None or yolo[0] == 0:
             if self._vs_lost_since is None:
                 self._vs_lost_since = time.time()
                 print(f"[State 2] YOLO 暫時丟失，維持當前速度中 ({VS_PATIENCE_SECS}s 耐心)")
-
             lost_dur = time.time() - self._vs_lost_since
             if lost_dur < VS_PATIENCE_SECS:
                 self.rc.publish_raw_car_control(self._last_vs_velocities)
                 self._iter += 1
                 return False
-            
             print(f"[State 2] 目標持續丟失超過 {VS_PATIENCE_SECS}s，退回搜尋狀態")
             self._vs_lost_since = None
             self.car.update_action("STOP")
             self._transition(DoorOpenState.SEARCH_HANDLE)
             return False
 
-        # ── 3. YOLO 正常偵測，執行 PID 控制 ──
         self._vs_lost_since = None
         pixel_offset = yolo[2]
-        
-        # 計算相對於目標補償值的誤差
         error = pixel_offset - VS_TARGET_PIXEL_OFFSET
 
+        # ─────────────────────────────────────────────────────────────────
+        # 精對齊階段：LiDAR 或 YOLO 深度已達停車距離，只做旋轉對齊
+        # ─────────────────────────────────────────────────────────────────
+        distance_reached = (lidar_dist and lidar_dist <= VS_STOP_DISTANCE)
+        if yolo[1] > 0:
+            d = yolo[1]
+            self._depth_ema = d if self._depth_ema is None else (
+                DEPTH_EMA_ALPHA * d + (1 - DEPTH_EMA_ALPHA) * self._depth_ema)
+            if self._depth_ema <= VS_STOP_DISTANCE:
+                distance_reached = True
+
+        if distance_reached:
+            # 第一次進入精對齊，記錄時間
+            if self._fine_align_since is None:
+                self._fine_align_since = time.time()
+                self._last_knob_depth = lidar_dist if lidar_dist else self._depth_ema
+                print(f"[State 2] 到達停車距離！開始精對齊 (誤差={error:.1f}px, 容差=±{VS_ALIGN_PIXEL_TOL}px)…")
+
+            # 對齊完成或超時：進入手臂動作
+            align_elapsed = time.time() - self._fine_align_since
+            if abs(error) <= VS_ALIGN_PIXEL_TOL:
+                print(f"[State 2] ✅ 精對齊完成！最終誤差={error:.1f}px，進入手臂動作")
+                self.car.update_action("STOP")
+                self._transition(DoorOpenState.ARM_AIM)
+                return False
+            if align_elapsed > VS_ALIGN_TIMEOUT:
+                print(f"[State 2] ⚠️ 精對齊逾時 ({VS_ALIGN_TIMEOUT}s)，最終誤差={error:.1f}px，強制進入手臂動作")
+                self.car.update_action("STOP")
+                self._transition(DoorOpenState.ARM_AIM)
+                return False
+
+            # 純原地旋轉：不前進，只修正左右
+            rotate_output = VS_ALIGN_KP * error
+            rotate_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, rotate_output))
+            v_left  =  rotate_output
+            v_right = -rotate_output
+            velocities = [v_left, v_right, v_left, v_right]
+            self.rc.publish_raw_car_control(velocities)
+            self._last_vs_velocities = velocities
+
+            if self._iter % 10 == 0:
+                print(f"[Align] 誤差={error:.1f}px, 原地旋轉 L={v_left:.0f}, R={v_right:.0f} ({align_elapsed:.1f}s)")
+            self._iter += 1
+            return False
+
+        # ─────────────────────────────────────────────────────────────────
+        # 靠近階段：同時前進 + 轉向
+        # ─────────────────────────────────────────────────────────────────
         steer_output = VS_KP_STEER * error
         steer_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, steer_output))
 
