@@ -501,7 +501,16 @@ class DoorOpenTask:
             else:
                 self._depth_ema = DEPTH_EMA_ALPHA * d + (1 - DEPTH_EMA_ALPHA) * self._depth_ema
 
+        # YOLO 深度 (可能無效)
         check_depth = self._depth_ema or self._last_knob_depth or 0.40
+        
+        # 輔助：LiDAR 測距
+        lidar_dist = self._get_front_lidar_min()
+        if lidar_dist and lidar_dist < check_depth:
+            # LiDAR 是測量門面，門把通常凸出門面幾公分，所以距離門把實際上會更近
+            # 但這裡保險起見，至少採信較小的值，防止撞門
+            check_depth = lidar_dist
+
         arm_x = check_depth + CAMERA_X_OFFSET
         elapsed = time.time() - self._arm_approach_start
 
@@ -509,7 +518,7 @@ class DoorOpenTask:
         if arm_x > ARM_MAX_REACH and elapsed < 10.0:
             self.car.update_action("FORWARD_SLOW")
             if self._iter % 20 == 0:
-                print(f"[State 4] 持續靠近… EMA depth={check_depth:.3f}m, arm_x={arm_x:.3f}m")
+                print(f"[State 4] 持續靠近… depth={check_depth:.3f}m, arm_x={arm_x:.3f}m (LiDAR={lidar_dist if lidar_dist else 0:.3f}m)")
             self._iter += 1
             return False
 
@@ -520,7 +529,7 @@ class DoorOpenTask:
         if elapsed >= 10.0:
             print(f"[State 4] 靠近逾時，強制在當前位置就地計算 arm_x={arm_x:.3f}m")
         else:
-            print(f"[State 4] 手臂可達！EMA depth={check_depth:.3f}m, arm_x={arm_x:.3f}m")
+            print(f"[State 4] 手臂可達！距離={check_depth:.3f}m, arm_x={arm_x:.3f}m")
 
         x_target = arm_x
         z_target = KNOB_Z_HEIGHT
