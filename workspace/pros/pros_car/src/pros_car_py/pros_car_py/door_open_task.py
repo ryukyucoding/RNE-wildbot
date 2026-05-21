@@ -200,6 +200,21 @@ class DoorOpenTask:
         通常在獨立執行緒中呼叫，或作為 ros2 run 的主函式。
         """
         print("[DoorOpenTask] 任務開始")
+
+        # ── 任務起始：先把手臂舉到最高安全位置 ──────────────────────────────
+        # 讓 Shoulder 盡量往上收（-180°），Elbow 打直（0°），夾爪張開（90°）
+        # 這樣在搜尋、對齊、前進的過程中手臂不會卡到任何東西
+        print("[DoorOpenTask] 手臂舉到最高，準備執行任務…")
+        try:
+            self.arm.joint_angles[0] = -180.0  # Shoulder 最高位置
+            self.arm.joint_angles[1] = 0.0     # Elbow 打直
+            self.arm.joint_angles[2] = 90.0    # Gripper 張開
+            self.arm._clamp_and_publish()
+            time.sleep(1.0)   # 等手臂確實到位
+        except Exception as e:
+            print(f"[DoorOpenTask] 手臂初始化警告（忽略）: {e}")
+        # ──────────────────────────────────────────────────────────────────────
+
         while not self.step():
             time.sleep(spin_interval)
         print("[DoorOpenTask] 任務結束，狀態:", self.state)
