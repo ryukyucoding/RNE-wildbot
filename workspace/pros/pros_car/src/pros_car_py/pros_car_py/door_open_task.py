@@ -50,6 +50,12 @@ VS_BASE_SPEED = 60.0
 VS_KP_STEER = 1.5           # 提高比例係數，讓車子更積極轉向對齊
 VS_MAX_STEER = 100.0        # 最大轉速差限制
 
+# ── 相機/手臂左右中心偏差補償 (像素) ───────────────────────────────────────────
+# 如果當車子停在門前時，門把總是偏向手臂的右側，代表車子應該要再往右偏一些來對準。
+# 可以把目標對齊像素設為「負值」（例如 -30.0 ~ -50.0），強迫車子在靠近時，將門把保持在影像的偏左側，使位於車身中線的手臂能夠往右偏對準門把！
+# 反之，如果門把總是偏左，就設為「正值」。
+VS_TARGET_PIXEL_OFFSET = 0.0
+
 # State 2：YOLO 丟失時的耐心（秒）。丟失後維持目前速度，不直接停車。
 VS_PATIENCE_SECS = 3.0      
 
@@ -381,8 +387,11 @@ class DoorOpenTask:
         # ── 3. YOLO 正常偵測，執行 PID 控制 ──
         self._vs_lost_since = None
         pixel_offset = yolo[2]
+        
+        # 計算相對於目標補償值的誤差
+        error = pixel_offset - VS_TARGET_PIXEL_OFFSET
 
-        steer_output = VS_KP_STEER * pixel_offset
+        steer_output = VS_KP_STEER * error
         steer_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, steer_output))
 
         v_left  = VS_BASE_SPEED + steer_output
@@ -393,7 +402,7 @@ class DoorOpenTask:
         self._last_vs_velocities = velocities
 
         if self._iter % 20 == 0:
-            print(f"[VS] offset={pixel_offset:.1f}px, steer={steer_output:.1f}, L={v_left:.0f}, R={v_right:.0f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
+            print(f"[VS] offset={pixel_offset:.1f}px (target={VS_TARGET_PIXEL_OFFSET:.1f}), steer={steer_output:.1f}, L={v_left:.0f}, R={v_right:.0f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
 
         self._iter += 1
         return False
