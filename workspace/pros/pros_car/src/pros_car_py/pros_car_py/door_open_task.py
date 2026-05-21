@@ -47,8 +47,9 @@ SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 # 為了讓車子有足夠時間把門把置中，降低前進速度
 VS_BASE_SPEED = 60.0
 # 轉向 PID 控制器參數：根據 pixel_offset 計算左右輪速差
-VS_KP_STEER = 1.5           # 提高比例係數，讓車子更積極轉向對齊
-VS_MAX_STEER = 100.0        # 最大轉速差限制
+VS_KP_STEER = 2.0           # 提高比例係數，讓車子更積極原地轉向
+VS_MAX_STEER = 300.0        # 最大轉速差限制 (調高以克服原地旋轉的靜摩擦力)
+VS_APPROACH_ALIGN_TOL = 30.0 # 靠近階段：誤差大於此值時，暫停前進並純旋轉
 
 # ── 相機/手臂左右中心偏差補償 (像素) ───────────────────────────────────────────
 # 如果當車子停在門前時，門把總是偏向手臂的右側，代表車子應該要再往右偏一些來對準。
@@ -407,6 +408,12 @@ class DoorOpenTask:
             # 純原地旋轉：不前進，只修正左右
             rotate_output = VS_ALIGN_KP * error
             rotate_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, rotate_output))
+            
+            # 給定最小旋轉動力，避免因靜摩擦力轉不動
+            min_rotate = 60.0
+            if 0 < rotate_output < min_rotate: rotate_output = min_rotate
+            if 0 > rotate_output > -min_rotate: rotate_output = -min_rotate
+            
             v_left  =  rotate_output
             v_right = -rotate_output
             velocities = [v_left, v_right, v_left, v_right]
@@ -419,20 +426,34 @@ class DoorOpenTask:
             return False
 
         # ─────────────────────────────────────────────────────────────────
-        # 靠近階段：同時前進 + 轉向
+        # 靠近階段：依誤差決定「純旋轉對齊」還是「純直線前進」
+        # (解決車子無法一邊前進一邊有效轉彎的問題)
         # ─────────────────────────────────────────────────────────────────
-        steer_output = VS_KP_STEER * error
-        steer_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, steer_output))
-
-        v_left  = VS_BASE_SPEED + steer_output
-        v_right = VS_BASE_SPEED - steer_output
+        if abs(error) > VS_APPROACH_ALIGN_TOL:
+            # 誤差較大：暫停前進，原地旋轉對準目標
+            rotate_output = VS_KP_STEER * error
+            rotate_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, rotate_output))
+            
+            # 給定最小旋轉動力（例如 80），避免因靜摩擦力轉不動而卡住
+            min_rotate = 80.0
+            if 0 < rotate_output < min_rotate: rotate_output = min_rotate
+            if 0 > rotate_output > -min_rotate: rotate_output = -min_rotate
+            
+            v_left  =  rotate_output
+            v_right = -rotate_output
+            action_str = "Turn"
+        else:
+            # 誤差極小：純直線前進
+            v_left  = VS_BASE_SPEED
+            v_right = VS_BASE_SPEED
+            action_str = "Fwd "
 
         velocities = [v_left, v_right, v_left, v_right]
         self.rc.publish_raw_car_control(velocities)
         self._last_vs_velocities = velocities
 
         if self._iter % 20 == 0:
-            print(f"[VS] offset={pixel_offset:.1f}px (target={VS_TARGET_PIXEL_OFFSET:.1f}), steer={steer_output:.1f}, L={v_left:.0f}, R={v_right:.0f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
+            print(f"[VS] [{action_str}] offset={pixel_offset:.1f}px, L={v_left:.0f}, R={v_right:.0f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
 
         self._iter += 1
         return False
