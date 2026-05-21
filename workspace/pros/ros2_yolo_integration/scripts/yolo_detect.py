@@ -7,7 +7,7 @@ import base64
 
 # open_door / HW4 detection model: classes bear, knob
 DEFAULT_MODEL = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "../src/yolo_example_pkg/models/detection.pt")
+    os.path.join(os.path.dirname(__file__), "../src/yolo_example_pkg/models/detection_knob.pt")
 )
 
 COLOR_MAP = {

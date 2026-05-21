@@ -36,7 +36,7 @@ class YoloDetectionNode(Node):
         self.latest_depth_image_compressed = None
         self.target_label = ""
 
-        model_name = os.environ.get("YOLO_MODEL", "detection.pt")
+        model_name = os.environ.get("YOLO_MODEL", "detection_knob.pt")
         model_path = os.path.join(
             get_package_share_directory("yolo_example_pkg"), "models", model_name
         )
