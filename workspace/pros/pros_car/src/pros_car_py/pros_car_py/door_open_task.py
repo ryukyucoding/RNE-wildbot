@@ -293,7 +293,7 @@ class DoorOpenTask:
             # 偵測到目標
             print("[State 1] 偵測到門把！")
             self.car.update_action("STOP")
-            self._transition(DoorOpenState.ALIGN_CAR)
+            self._transition(DoorOpenState.VISUAL_SERVO_APPROACH)
             return False
 
         # 緩慢順時針旋轉搜尋
