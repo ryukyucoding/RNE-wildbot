@@ -55,7 +55,7 @@ VS_PATIENCE_SECS = 3.0
 
 # State 2：Visual Servoing 的停車條件
 # 當 LiDAR 測量到門面小於等於這個距離，或者 YOLO depth 小於等於這個距離時停車
-VS_STOP_DISTANCE = 0.25     # 0.25m 停車 (讓手臂剛剛好夠得到)
+VS_STOP_DISTANCE = 0.30     # 0.30m 停車 (離門把更安全且剛好夠得到)
 
 # 深度 EMA 平滑係數（0~1，越小越平滑，越大越即時）
 DEPTH_EMA_ALPHA = 0.3
@@ -410,9 +410,9 @@ class DoorOpenTask:
             self._iter = 1
             time.sleep(0.3)
 
-        # 車子在 State 2 已經因為 LiDAR 或 YOLO 深度達到 VS_STOP_DISTANCE (0.25m) 而精準停車。
-        # 所以 arm_x = VS_STOP_DISTANCE + CAMERA_X_OFFSET = 0.25 + (-0.15) = 0.10m
-        # 0.10m 完美落在 ARM_MAX_REACH (0.17m) 內，絕不超距！
+        # 車子在 State 2 已經因為 LiDAR 或 YOLO 深度達到 VS_STOP_DISTANCE (0.30m) 而精準停車。
+        # 所以 arm_x = VS_STOP_DISTANCE + CAMERA_X_OFFSET = 0.30 + (-0.15) = 0.15m
+        # 0.15m 完美落在 ARM_MAX_REACH (0.17m) 內，絕不超距，且關節角度更舒展！
         
         check_depth = self._last_knob_depth if self._last_knob_depth else VS_STOP_DISTANCE
         arm_x = check_depth + CAMERA_X_OFFSET
