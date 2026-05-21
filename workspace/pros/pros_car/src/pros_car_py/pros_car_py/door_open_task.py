@@ -44,10 +44,10 @@ SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 
 # ── Visual Servoing (PID) 參數 ────────────────────────────────────────────────
 # 基礎前進速度（rad/s，對應輪胎轉速）
-# 根據你的 ACTION_MAPPINGS，FORWARD_SLOW 的速度大約是 150 (3.0 * 50)
-VS_BASE_SPEED = 120.0
+# 為了讓車子有足夠時間把門把置中，降低前進速度
+VS_BASE_SPEED = 60.0
 # 轉向 PID 控制器參數：根據 pixel_offset 計算左右輪速差
-VS_KP_STEER = 0.5           # 比例係數 (例如 offset=50px -> 轉速差=25)
+VS_KP_STEER = 1.5           # 提高比例係數，讓車子更積極轉向對齊
 VS_MAX_STEER = 100.0        # 最大轉速差限制
 
 # State 2：YOLO 丟失時的耐心（秒）。丟失後維持目前速度，不直接停車。

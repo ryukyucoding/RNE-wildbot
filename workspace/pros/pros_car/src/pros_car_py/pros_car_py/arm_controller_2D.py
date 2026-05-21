@@ -312,8 +312,9 @@ class ArmController:
                 return cand # 找到合法的同界角，直接回傳！
                 
         # 如果加減 360 度後都不在範圍內，代表這個姿勢真的超出了手臂極限。
-        # 我們先回傳原始角度，後續交給 _clamp_and_publish 去強制卡在邊界防呆。
-        return angle
+        # 為了避免 _smooth_move_to 陷入死迴圈，我們直接把它 clamp 到最近的極限值
+        closest_cand = min(candidates, key=lambda c: min(abs(c - min_limit), abs(c - max_limit)))
+        return max(min_limit, min(max_limit, closest_cand))
     # ==========================================
     # 5. 視覺化手臂 (Foxglove Lines)
     # ==========================================
