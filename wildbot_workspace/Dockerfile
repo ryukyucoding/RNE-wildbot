@@ -10,7 +10,8 @@ RUN cp -r ./workspaces/* /workspaces && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-demo-nodes-py \
-        ros-${ROS_DISTRO}-demo-nodes-cpp && \
+        ros-${ROS_DISTRO}-demo-nodes-cpp \
+        ros-${ROS_DISTRO}-foxglove-bridge && \
     rosdep update --rosdistro ${ROS_DISTRO} && \
     colcon mixin update && \
     colcon metadata update

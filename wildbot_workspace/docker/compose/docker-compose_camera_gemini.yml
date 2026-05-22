@@ -12,9 +12,9 @@ services:
     - launch
     - orbbec_camera
     - gemini_ew.launch.py    
-    - color_width:=1280
-    - color_height:=720
-    - color_fps:=30
+    - color_width:=640
+    - color_height:=480
+    - color_fps:=15
     - depth_width:=1280
     - depth_height:=800
     - depth_fps:=30
@@ -27,7 +27,7 @@ services:
       - my_bridge_network
     depends_on:
       - dabai
-    command: "ros2 run image_transport republish raw --ros-args --remap in:=camera/color/image_raw -p out:=camera/compressed"
+    command: "ros2 run image_transport republish raw compressed --ros-args --remap in:=camera/color/image_raw --remap out:=camera/color/image_raw -p out.compressed.jpeg_quality:=50"
 
 networks:
   my_bridge_network:
