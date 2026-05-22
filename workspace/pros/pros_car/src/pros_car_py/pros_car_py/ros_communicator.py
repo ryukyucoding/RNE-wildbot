@@ -17,16 +17,35 @@ from nav2_msgs.action import NavigateToPose
 import rclpy
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 
 class RosCommunicator(Node):
-    def __init__(self):
-        super().__init__("RosCommunicator")
+    def __init__(self, node_name: str = "RosCommunicator"):
+        super().__init__(node_name)
 
-        # subscribeamcl_pose
+        self.declare_parameter("amcl_pose_topic", "/amcl_pose")
+
+        # subscribe amcl_pose (topic 可用 launch / ros-args remap 或參數覆寫)
         self.latest_amcl_pose = None
+        amcl_topic = (
+            self.get_parameter("amcl_pose_topic").get_parameter_value().string_value
+        )
+        # Nav2 AMCL 通常為 RELIABLE + TRANSIENT_LOCAL（latched pose）。
+        # 若用 BEST_EFFORT + VOLATILE 會與 AMCL 不相容，訂閱端永遠收不到 pose。
+        amcl_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.subscriber_amcl = self.create_subscription(
-            PoseWithCovarianceStamped, "/amcl_pose", self.subscriber_amcl_callback, 1
+            PoseWithCovarianceStamped,
+            amcl_topic,
+            self.subscriber_amcl_callback,
+            amcl_qos,
+        )
+        self.get_logger().info(
+            f"Subscribing PoseWithCovarianceStamped on '{amcl_topic}' (localization AMCL)."
         )
 
         # subscribe goal_pose
@@ -91,6 +110,14 @@ class RosCommunicator(Node):
             Float32MultiArray,
             "/camera/x_multi_depth_values",
             self.camera_x_multi_depth_callback,
+            10,
+        )
+
+        self.latest_obstacle_sector_depth = None
+        self.obstacle_sector_depth_sub = self.create_subscription(
+            Float32MultiArray,
+            "/obstacle/sector_min_depth",
+            self.obstacle_sector_depth_callback,
             10,
         )
 
@@ -250,8 +277,7 @@ class RosCommunicator(Node):
         self.latest_amcl_pose = msg
 
     def get_latest_amcl_pose(self):
-        if self.latest_amcl_pose is None:
-            self.get_logger().warn("No AMCL pose data received yet.")
+        # 勿在此對每次呼叫 warn（bear_mission 輪詢會洗版）；缺資料由上層限頻記錄
         return self.latest_amcl_pose
 
     # goal callback and get_latest_goal
@@ -377,6 +403,14 @@ class RosCommunicator(Node):
         if self.latest_camera_x_multi_depth is None:
             return None
         return self.latest_camera_x_multi_depth
+
+    def obstacle_sector_depth_callback(self, msg):
+        self.latest_obstacle_sector_depth = msg
+
+    def get_latest_obstacle_sector_depth(self):
+        if self.latest_obstacle_sector_depth is None:
+            return None
+        return self.latest_obstacle_sector_depth
 
     # YOLO coordinates callback
     def yolo_detection_position_callback(self, msg):

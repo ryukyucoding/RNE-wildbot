@@ -10,7 +10,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        # ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
+        ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "robot_control = pros_car_py.main2:main",
+            "bear_mission = pros_car_py.bear_mission_node:main",
             "carC_reader = pros_car_py.carC_serial_reader:main",
             "carC_writer = pros_car_py.carC_serial_writer:main",
             "arm_reader = pros_car_py.arm_reader:main",

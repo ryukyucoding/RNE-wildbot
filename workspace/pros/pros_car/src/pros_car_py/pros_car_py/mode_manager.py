@@ -59,9 +59,9 @@ class AutoNavMode(BaseMode):
 
     def handle_submode_select(self, submode):
         def on_key(key):
-            self.app.car_controller.auto_control(submode, key)
-            if key == "q":
-                self.app.car_controller.auto_control(submode, key=key)
+            # 必須用 keyword：`auto_control(mode=..., key=...)`。
+            # 若寫成 auto_control(submode, key)，第二個位置會傳進 target，key 永遠是 None。
+            self.app.car_controller.auto_control(mode=submode, key=key)
 
         self.show_submode_screen(
             message=f"AutoNav Mode: Submode {submode}\nPress 'q' to go back.",

@@ -1,7 +1,31 @@
 #!/bin/bash
 
+# 須與 pros_app localization / navigation 的 Docker bridge **同名**，否則收不到 /amcl_pose。
+# 請在主機執行：docker network ls | grep my_bridge
+# 常見：pros_app_my_bridge_network（在 pros_app 目錄跑 compose）或 compose_my_bridge_network。
+: "${ROS_BRIDGE_NETWORK:=compose_my_bridge_network}"
+
+case "${ROS_BRIDGE_NETWORK}" in
+    /*)
+        echo "[car_control] 錯誤：ROS_BRIDGE_NETWORK='${ROS_BRIDGE_NETWORK}' 以 '/' 開頭。"
+        echo "這是 ROS **話題**寫法，不是 Docker **網路**名稱。"
+        echo "請執行：docker network ls | grep bridge"
+        echo "再設例如：export ROS_BRIDGE_NETWORK=compose_my_bridge_network"
+        exit 1
+        ;;
+esac
+
+# 若主機已 export ROS_DOMAIN_ID，強制傳進容器（須與 yolo／localization 容器一致）。
+EXTRA_DOCKER_ENV=""
+if [ -n "${ROS_DOMAIN_ID+x}" ] && [ -n "${ROS_DOMAIN_ID}" ]; then
+    EXTRA_DOCKER_ENV="-e ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
+    echo "[car_control] Will pass ${EXTRA_DOCKER_ENV} into container (must match yolo & localization)."
+fi
+
 # 1. 統一管理 -v 參數
 VOLUME_ARGS="-v $(pwd)/src:/workspaces/src -v $(pwd)/launch:/workspaces/launch"
+
+echo "[car_control] Docker bridge network: ${ROS_BRIDGE_NETWORK} (override: ROS_BRIDGE_NETWORK=... $0)"
 
 # Port mapping check
 PORT_MAPPING=""
@@ -59,16 +83,17 @@ fi
 
 # 根據不同架構選擇適當的 Docker 圖像
 if [ "$ARCH" = "aarch64" ]; then
-      echo "Detected architecture: arm64"
-      docker run -it --rm \
-          --network compose_my_bridge_network \
-          $PORT_MAPPING \
-          $device_options \
-          $GPU_FLAGS \
-          --env-file .env \
-          -v "$(pwd)/src:/workspaces/src" \
-          ghcr.io/screamlab/pros_car_docker_image:latest \
-          /bin/bash
+    echo "Detected architecture: arm64"
+    docker run -it --rm \
+        --network "${ROS_BRIDGE_NETWORK}" \
+        $PORT_MAPPING \
+        $device_options \
+        --runtime=nvidia \
+        --env-file .env \
+        $EXTRA_DOCKER_ENV \
+        -v "$(pwd)/src:/workspaces/src" \
+        ghcr.io/screamlab/pros_car_docker_image:latest \
+        /bin/bash
 
 elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); then
     echo "Detected architecture: amd64 or macOS arm64"
@@ -76,21 +101,23 @@ elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); 
     if [ "$OS" = "Darwin" ]; then
         echo "Running Docker on macOS (without GPU support)..."
         docker run -it --rm \
-            --network compose_my_bridge_network \
+            --network "${ROS_BRIDGE_NETWORK}" \
             $PORT_MAPPING \
             $device_options \
             --env-file .env \
+            $EXTRA_DOCKER_ENV \
             $VOLUME_ARGS \
             ghcr.io/screamlab/pros_car_docker_image:latest \
             /bin/bash
     else
         echo "Trying to run with GPU support..."
         docker run -it --rm \
-            --network compose_my_bridge_network \
+            --network "${ROS_BRIDGE_NETWORK}" \
             $PORT_MAPPING \
             $GPU_FLAGS \
             $device_options \
             --env-file .env \
+            $EXTRA_DOCKER_ENV \
             $VOLUME_ARGS \
             ghcr.io/screamlab/pros_car_docker_image:latest \
             /bin/bash
@@ -99,9 +126,10 @@ elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); 
         if [ $? -ne 0 ]; then
             echo "GPU not supported or failed, falling back to CPU mode..."
             docker run -it --rm \
-                --network compose_my_bridge_network \
+                --network "${ROS_BRIDGE_NETWORK}" \
                 $PORT_MAPPING \
                 --env-file .env \
+                $EXTRA_DOCKER_ENV \
                 $device_options \
                 $VOLUME_ARGS \
                 ghcr.io/screamlab/pros_car_docker_image:latest \

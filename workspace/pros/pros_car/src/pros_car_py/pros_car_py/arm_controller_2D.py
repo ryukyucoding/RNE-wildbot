@@ -137,7 +137,97 @@ class ArmController:
 
         except Exception as e:
             print(f"⚠️ 座標轉換或 TF 失敗: {e}")
-    
+
+    def run_grasp_blocking(self, marker_msg=None):
+        """
+        同步執行完整抓取流程（可給定 Marker；預設使用 ros_communicator.latest_yolo_marker）。
+        需在背景有 rclpy executor / spin，以便 TF 更新。
+        """
+        marker = marker_msg if marker_msg is not None else self.ros_communicator.latest_yolo_marker
+        if marker is None:
+            print("尚未收到 /yolo/target_marker，無法抓取")
+            return False
+
+        target_map = PointStamped()
+        target_map.header.frame_id = marker.header.frame_id
+        target_map.header.stamp = self.ros_communicator.get_clock().now().to_msg()
+        target_map.point = marker.pose.position
+
+        try:
+            from rclpy.duration import Duration
+
+            transform = self.tf_buffer.lookup_transform(
+                self.base_link_name,
+                target_map.header.frame_id,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=5.0),
+            )
+            target_base = tf2_geometry_msgs.do_transform_point(target_map, transform)
+            x_target = target_base.point.x
+            z_target = target_base.point.z
+            print(f"🎯 [blocking grasp] 目標 arm 基座座標: X={x_target:.3f}, Z={z_target:.3f}")
+            self._execute_grab_sequence(x_target, z_target)
+            return True
+        except Exception as e:
+            print(f"⚠️ run_grasp_blocking TF 失敗: {e}")
+            return False
+
+    def _physical_deg_to_internal(self, joint_idx, physical_deg):
+        """Unity / 實體關節角度 → internal angle（physical = internal * dir）。"""
+        direction = self.joint_limits[joint_idx].get("dir", 1.0)
+        if direction == 0:
+            return physical_deg
+        return physical_deg / direction
+
+    def _internal_deg_to_physical(self, joint_idx, internal_deg):
+        return internal_deg * self.joint_limits[joint_idx].get("dir", 1.0)
+
+    def run_unity_vision_stow_blocking(self, unity_elbow_deg=180.0):
+        """
+        Unity 虛擬環境：任務開始前將 Elbow 放低，避免夾爪擋住相機視野。
+        unity_elbow_deg: Unity 介面顯示的角度（最低約 180°）。
+        """
+        try:
+            target_internal = self._physical_deg_to_internal(1, unity_elbow_deg)
+            min_a = self.joint_limits[1]["min_angle"]
+            max_a = self.joint_limits[1]["max_angle"]
+            target_internal = max(min_a, min(max_a, target_internal))
+            physical = self._internal_deg_to_physical(1, target_internal)
+            print(
+                f"📷 [unity stow] Elbow → Unity {physical:.1f}° "
+                f"(internal {target_internal:.1f}°)"
+            )
+            self._smooth_move_to([None, target_internal, None], step=5.0, delay=0.1)
+            time.sleep(0.3)
+            return True
+        except Exception as e:
+            print(f"⚠️ run_unity_vision_stow_blocking 失敗: {e}")
+            return False
+
+    def run_release_blocking(self):
+        """
+        在「已經帶著目標回家」後同步執行放下：
+        1) 先回到安全姿態（避免夾爪過低卡住）
+        2) 打開夾爪釋放物件
+        """
+        try:
+            print("🧺 [release] 回到安全姿態...")
+            init_angles = [None, self.joint_limits[1]["init"], None]
+            self._smooth_move_to(init_angles, step=5.0, delay=0.1)
+            init_angles = [self.joint_limits[0]["init"], None, None]
+            self._smooth_move_to(init_angles, step=5.0, delay=0.1)
+            time.sleep(0.3)
+
+            print("🧺 [release] 打開夾爪放下目標...")
+            target_open = [None, None, self.joint_limits[2]["max_angle"]]
+            self._smooth_move_to(target_open, step=5.0, delay=0.1)
+            time.sleep(0.5)
+            print("✅ [release] 目標已放下")
+            return True
+        except Exception as e:
+            print(f"⚠️ run_release_blocking 失敗: {e}")
+            return False
+
     def _execute_grab_sequence(self, x_target, z_target):
         """背景執行的完整抓取流程 (結合軌跡規劃)"""
         
@@ -206,17 +296,26 @@ class ArmController:
         - step: 每次更新的最大度數 (越小越滑順)
         - delay: 每次更新間隔的時間 (越大越慢)
         """
+        # 先把目標夾到合法範圍，避免超範圍目標導致軌跡無法收斂
+        sanitized_targets = list(target_angles)
+        for i in range(len(self.joint_angles)):
+            if sanitized_targets[i] is None:
+                continue
+            min_a = self.joint_limits[i]["min_angle"]
+            max_a = self.joint_limits[i]["max_angle"]
+            sanitized_targets[i] = max(min_a, min(max_a, sanitized_targets[i]))
+
         while True:
             all_reached = True
             
             for i in range(len(self.joint_angles)):
-                if target_angles[i] is None:
+                if sanitized_targets[i] is None:
                     continue # None 代表該關節不移動
                     
-                diff = target_angles[i] - self.joint_angles[i]
+                diff = sanitized_targets[i] - self.joint_angles[i]
                 
                 if abs(diff) <= step:
-                    self.joint_angles[i] = target_angles[i]
+                    self.joint_angles[i] = sanitized_targets[i]
                 else:
                     self.joint_angles[i] += step if diff > 0 else -step
                     all_reached = False # 只要有一個關節還沒到，就繼續迴圈
@@ -246,9 +345,8 @@ class ArmController:
             if min_limit <= cand <= max_limit:
                 return cand # 找到合法的同界角，直接回傳！
                 
-        # 如果加減 360 度後都不在範圍內，代表這個姿勢真的超出了手臂極限。
-        # 我們先回傳原始角度，後續交給 _clamp_and_publish 去強制卡在邊界防呆。
-        return angle
+        # 如果加減 360 度後都不在範圍內，直接夾到邊界，避免目標超範圍導致迴圈卡住。
+        return max(min_limit, min(max_limit, angle))
     # ==========================================
     # 5. 視覺化手臂 (Foxglove Lines)
     # ==========================================

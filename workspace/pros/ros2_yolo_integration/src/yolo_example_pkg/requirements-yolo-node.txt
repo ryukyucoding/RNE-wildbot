@@ -1,0 +1,6 @@
+# yolo_example_pkg / yolo_activate 容器內：pip3 install（約數百 MB）
+#   pip3 install -r install/share/yolo_example_pkg/requirements-yolo-node.txt
+# 或：pip3 install torch ultralytics opencv-python-headless
+ultralytics>=8.0
+torch>=2.0
+opencv-python-headless

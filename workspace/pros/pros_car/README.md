@@ -1,4 +1,26 @@
 # pros_car 使用說明
+
+## 🐻 夾熊任務（Bear Mission）
+
+自動流程：YOLO 偵測熊 → 視覺逼近 → 機械臂夾取 → Nav2 回起點。
+
+**完整操作步驟、Topic 對照、參數說明與常見問題排解**請見：
+
+👉 **[BEAR_MISSION.md](./BEAR_MISSION.md)**
+
+快速啟動（需先啟動 localization、YOLO，且勿與 `robot_control` 同時執行）：
+
+```bash
+export ROS_BRIDGE_NETWORK=compose_my_bridge_network
+export ROS_DOMAIN_ID=<與 yolo、localization 相同>
+./car_control.sh
+# 容器內：r 後
+ros2 launch pros_car_py bear_task1.launch.py
+# 實車請加：use_unity_camera_nav:=false
+```
+
+---
+
 ## class diagram
 ![pros_car](https://github.com/alianlbj23/pros_car/blob/main/img/pros_car.drawio.png?raw=true)
 ## 🚀 環境初始化
