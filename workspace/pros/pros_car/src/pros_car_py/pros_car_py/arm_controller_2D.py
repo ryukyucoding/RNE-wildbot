@@ -58,17 +58,20 @@ class ArmController:
         clamped_angle = max(min(target_angle, max_angle), min_angle)
         
         # 紀錄改變前的狀態
-        old_j0 = self.joint_angles[0]
-        old_j1 = self.joint_angles[1]
-        old_j2 = self.joint_angles[2]
+        old_joints = [self.joint_angles[0], self.joint_angles[1], self.joint_angles[2]]
         
         self.joint_angles[2] = clamped_angle
         
         print("----------------------------------------")
-        print(f"🦾 [夾爪控制] 關節狀態更新:")
-        print(f"  [Joint 0 - Shoulder] 目前: {old_j0:.1f}° -> 目標: {self.joint_angles[0]:.1f}°")
-        print(f"  [Joint 1 - Elbow]    目前: {old_j1:.1f}° -> 目標: {self.joint_angles[1]:.1f}°")
-        print(f"  [Joint 2 - Gripper]  目前: {old_j2:.1f}° -> 目標: {self.joint_angles[2]:.1f}°")
+        print(f"🦾 [夾爪控制] 發布到馬達的實際數值 (Hardware Limits & Radians):")
+        names = ["Shoulder", "Elbow", "Gripper"]
+        for i in range(3):
+            dir_mult = self.joint_limits[i].get("dir", 1.0)
+            old_hw_deg = old_joints[i] * dir_mult
+            new_hw_deg = self.joint_angles[i] * dir_mult
+            old_rad = math.radians(old_hw_deg)
+            new_rad = math.radians(new_hw_deg)
+            print(f"  [Joint {i} - {names[i]:<8}] 目前: {old_hw_deg:>6.1f}° ({old_rad:>4.2f} rad) -> 目標: {new_hw_deg:>6.1f}° ({new_rad:>4.2f} rad)")
         print("----------------------------------------")
         
         self._clamp_and_publish()
