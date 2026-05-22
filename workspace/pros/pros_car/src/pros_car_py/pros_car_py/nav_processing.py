@@ -6,6 +6,9 @@ from pros_car_py.nav2_utils import (
     cal_distance,
 )
 import math
+import time
+
+from pros_car_py.obstacle_guard import ObstacleGuard, get_lidar_sector_minimums
 
 
 class Nav2Processing:
@@ -18,6 +21,15 @@ class Nav2Processing:
         self.index_length = 0
         self.recordFlag = 0
         self.goal_published_flag = False
+        self._vs_last_time = None
+        self._vs_i_yaw = 0.0
+        self._vs_i_depth = 0.0
+        self._vs_prev_yaw_err = 0.0
+        self._vs_prev_depth_err = 0.0
+        self._vs_last_seen_time = 0.0
+        self._vs_last_x_offset = None
+        self._vs_last_depth = None
+        self._vs_prev_dx_px = None
 
     def reset_nav_process(self):
         self.finishFlag = False
@@ -195,9 +207,9 @@ class Nav2Processing:
         # if all(depth > limit_distance for depth in camera_forward_depth):
         if yolo_target_info[0] == 1:
             if yolo_target_info[2] > 200.0:
-                action = "CLOCKWISE_ROTATION_SLOW"
+                action = "CLOCKWISE_ROTATION"
             elif yolo_target_info[2] < -200.0:
-                action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+                action = "COUNTERCLOCKWISE_ROTATION"
             else:
                 if yolo_target_info[1] < 0.5:
                     action = "STOP"
@@ -205,11 +217,229 @@ class Nav2Processing:
                     action = "FORWARD_SLOW"
         else:
             action = "CLOCKWISE_ROTATION"
-        # elif any(depth < limit_distance for depth in camera_left_depth):
-        #     action = "CLOCKWISE_ROTATION"
-        # elif any(depth < limit_distance for depth in camera_right_depth):
-        #     action = "COUNTERCLOCKWISE_ROTATION"
         return action
+
+    def apply_obstacle_guard_action(
+        self,
+        action: str,
+        guard: ObstacleGuard,
+        enabled: bool = True,
+    ) -> str:
+        """Override discrete nav action when LiDAR/depth sectors are too close."""
+        if not enabled:
+            return action
+        obs = guard.evaluate(
+            lidar_sectors=get_lidar_sector_minimums(self.data_processor),
+            multi_depth=self.data_processor.get_camera_x_multi_depth(),
+            sector_depth=self.data_processor.get_obstacle_sector_depth(),
+        )
+        if obs.block_cmd and obs.speed_scale <= 0.05:
+            return obs.block_cmd
+        if action in ("FORWARD_SLOW", "FORWARD") and obs.speed_scale < 0.35:
+            return "STOP"
+        return action
+
+    def reset_visual_servo(self):
+        self._vs_last_time = None
+        self._vs_i_yaw = 0.0
+        self._vs_i_depth = 0.0
+        self._vs_prev_yaw_err = 0.0
+        self._vs_prev_depth_err = 0.0
+        self._vs_last_seen_time = 0.0
+        self._vs_last_x_offset = None
+        self._vs_last_depth = None
+        self._vs_prev_dx_px = None
+
+    def compute_yaw_wheel_from_pixel(
+        self,
+        dx_px: float,
+        max_yaw_wheel: float,
+        deadband_px: float = 28.0,
+        soft_scale_px: float = 100.0,
+        dt: float = 0.1,
+        min_yaw_large_px: float = 100.0,
+    ) -> float:
+        """
+        像素偏差 → 連續轉向輪速。
+        - 小偏差：tanh 平滑，避免 overshoot
+        - 大偏差：保底最小轉向力，避免原地卡住
+        """
+        scale = max(40.0, float(soft_scale_px))
+        cap = float(max_yaw_wheel)
+
+        # 軟死區：小偏差仍給弱轉向，避免 dx≈20px 時完全不修而持續偏一側
+        if abs(dx_px) <= deadband_px:
+            self._vs_prev_dx_px = dx_px
+            if abs(dx_px) < 2.0:
+                return 0.0
+            ratio = abs(dx_px) / max(deadband_px, 1.0)
+            yaw_soft = math.copysign(cap * 0.18 * (ratio**1.4), dx_px)
+            return max(-cap * 0.22, min(cap * 0.22, yaw_soft))
+
+        err = dx_px - math.copysign(deadband_px, dx_px)
+        abs_err = abs(err)
+
+        if abs_err >= 120.0:
+            ratio = min(1.0, abs_err / (scale * 1.4))
+            yaw_mag = max(cap * 0.85, ratio * cap * 0.98)
+        elif abs_err >= 70.0:
+            ratio = math.tanh(abs_err / scale)
+            yaw_mag = ratio * cap * 1.12
+        else:
+            ratio = math.tanh(abs_err / max(scale * 0.75, 30.0))
+            yaw_mag = ratio * cap * 0.95
+
+        yaw_cmd = math.copysign(yaw_mag, err)
+
+        # 大偏差保底：至少 min_yaw_large_px 等效輪速
+        if abs_err >= 85.0:
+            floor = min(cap, float(min_yaw_large_px))
+            if abs(yaw_cmd) < floor:
+                yaw_cmd = math.copysign(floor, err)
+        if abs_err >= 180.0:
+            strong_floor = min(cap, float(min_yaw_large_px) * 1.35)
+            if abs(yaw_cmd) < strong_floor:
+                yaw_cmd = math.copysign(strong_floor, err)
+
+        # 僅在接近中心時做 overshoot 阻尼
+        if self._vs_prev_dx_px is not None and dt > 1e-3 and abs(dx_px) < 70.0:
+            dx_rate = (dx_px - self._vs_prev_dx_px) / dt
+            if dx_px * dx_rate < 0.0:
+                damp = max(0.35, 1.0 - abs(dx_rate) / 140.0)
+                yaw_cmd *= damp
+
+        self._vs_prev_dx_px = dx_px
+        return max(-cap, min(cap, yaw_cmd))
+
+    def camera_nav_pid_command(
+        self,
+        target_depth_m=0.42,
+        search_spin_speed=70.0,
+        max_forward_speed=170.0,
+        max_forward_speed_far=300.0,
+        far_distance_m=0.90,
+        max_yaw_speed=300.0,
+        lost_timeout_sec=0.8,
+        center_deadband_px=45.0,
+        image_half_width_px=320.0,
+        large_turn_pixel_thresh=100.0,
+        center_first=True,
+        yaw_gain_per_px=0.0,
+        yaw_soft_scale_px=120.0,
+        yaw_deadband_px=12.0,
+        min_yaw_large_px=100.0,
+        pixel_offset_bias_px=0.0,
+    ):
+        """
+        視覺伺服（近距離）：
+        以 YOLO 的像素中心偏移 + 深度誤差做 PID，直接輸出輪速。
+        回傳: [rear_left, rear_right, front_left, front_right]
+        """
+        now = time.monotonic()
+        if self._vs_last_time is None:
+            self._vs_last_time = now
+        dt = max(0.02, min(0.2, now - self._vs_last_time))
+        self._vs_last_time = now
+
+        yolo_target_info = self.data_processor.get_yolo_target_info()
+        if yolo_target_info is None or len(yolo_target_info) < 3:
+            # 沒資料時先停
+            return [0.0, 0.0, 0.0, 0.0]
+
+        detected = yolo_target_info[0] == 1.0
+        depth = float(yolo_target_info[1])
+        x_offset_px = float(yolo_target_info[2]) - float(pixel_offset_bias_px)
+
+        # 目標短暫丟失：沿用上一幀誤差繼續走，避免多熊切換時原地空轉
+        if not detected:
+            hold_sec = max(float(lost_timeout_sec), 1.2)
+            if (
+                self._vs_last_x_offset is not None
+                and (now - self._vs_last_seen_time) <= hold_sec
+            ):
+                detected = True
+                x_offset_px = float(self._vs_last_x_offset)
+                depth = (
+                    float(self._vs_last_depth)
+                    if self._vs_last_depth is not None
+                    else depth
+                )
+            else:
+                spin = abs(float(search_spin_speed))
+                return [-spin, spin, -spin, spin]
+        else:
+            self._vs_last_seen_time = now
+            self._vs_last_x_offset = x_offset_px
+            if depth > 0.0:
+                self._vs_last_depth = depth
+
+        depth_valid = depth > 0.0
+        far_mode = depth_valid and depth > float(far_distance_m)
+        fwd_cap = (
+            float(max_forward_speed_far) if far_mode else float(max_forward_speed)
+        )
+        yaw_cap = float(max_yaw_speed)
+
+        # 連續視覺轉向：像素 → 輪速（取代 bang-bang 全速自轉）
+        yaw_cmd = self.compute_yaw_wheel_from_pixel(
+            x_offset_px,
+            max_yaw_wheel=yaw_cap,
+            deadband_px=yaw_deadband_px,
+            soft_scale_px=yaw_soft_scale_px,
+            dt=dt,
+            min_yaw_large_px=min_yaw_large_px,
+        )
+
+        depth_err = (depth - target_depth_m) if depth_valid else 0.0
+        dep_kp, dep_ki, dep_kd = 200.0, 8.0, 8.0
+
+        if depth_valid:
+            self._vs_i_depth = max(-1.0, min(1.0, self._vs_i_depth + depth_err * dt))
+            dep_der = (depth_err - self._vs_prev_depth_err) / dt
+            self._vs_prev_depth_err = depth_err
+            forward_cmd = (
+                dep_kp * depth_err + dep_ki * self._vs_i_depth + dep_kd * dep_der
+            )
+            if far_mode:
+                if depth_err < 0.40:
+                    forward_cmd = min(fwd_cap, forward_cmd)
+                else:
+                    forward_cmd = max(fwd_cap * 0.85, forward_cmd)
+            else:
+                forward_cmd = min(fwd_cap, forward_cmd)
+            # 進入 grasp 前段：距離越近越強制降速（避免直衝停不住）
+            if depth <= target_depth_m + 0.55:
+                t = max(0.0, (depth - target_depth_m) / 0.55)
+                forward_cmd = min(
+                    forward_cmd,
+                    fwd_cap * max(0.08, t ** 2.0),
+                )
+        else:
+            forward_cmd = fwd_cap * 0.7 if far_mode else 0.0
+
+        # 未置中時抑制前進；大偏差允許邊轉邊走（arc turn），避免原地卡死
+        if (
+            center_first
+            and not far_mode
+            and abs(x_offset_px) > float(center_deadband_px)
+        ):
+            if abs(x_offset_px) > 90.0:
+                forward_cmd *= 0.45
+            else:
+                forward_cmd *= 0.18
+        elif far_mode and abs(x_offset_px) > 100.0:
+            # 大角度偏差時降低前進，讓轉向輪速主導（避免弧線往反側偏）
+            misalign = min(1.0, abs(x_offset_px) / 260.0)
+            forward_cmd *= max(0.30, 1.0 - 0.62 * misalign)
+
+        forward_cmd = max(-fwd_cap, min(fwd_cap, forward_cmd))
+
+        wheel_cap = max(fwd_cap, yaw_cap) * 1.15
+        # 與 COUNTERCLOCKWISE_ROTATION [-v,+v] 一致：yaw<0 → 左轉，left=fwd+yaw, right=fwd-yaw
+        left = max(-wheel_cap, min(wheel_cap, forward_cmd + yaw_cmd))
+        right = max(-wheel_cap, min(wheel_cap, forward_cmd - yaw_cmd))
+
+        return [left, right, left, right]
 
     def camera_nav_unity(self):
         """
@@ -254,9 +484,9 @@ class Nav2Processing:
         if all(depth > limit_distance for depth in camera_forward_depth):
             if yolo_target_info[0] == 1:
                 if yolo_target_info[2] > 200.0:
-                    action = "CLOCKWISE_ROTATION_SLOW"
+                    action = "CLOCKWISE_ROTATION"
                 elif yolo_target_info[2] < -200.0:
-                    action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+                    action = "COUNTERCLOCKWISE_ROTATION"
                 else:
                     if yolo_target_info[1] < 2.0:
                         action = "STOP"
