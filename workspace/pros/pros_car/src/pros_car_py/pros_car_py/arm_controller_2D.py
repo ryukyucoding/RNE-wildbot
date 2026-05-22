@@ -34,7 +34,7 @@ class ArmController:
         # 動態定義所有關節 (加入 length 臂長 與 angle_offset 角度補償)
         # angle_offset: IK 算出來的數學 0 度可能不是 Unity 的 0 度，可透過這個補償
         self.joint_limits = [
-            {"length": 0.08089007, "min_angle": -210, "max_angle": -30, "init": -170, "offset": 100, "dir": -1.0},  # Joint 0 (Shoulder) - 硬體: 30 ~ 210度
+            {"length": 0.08089007, "min_angle": -210, "max_angle": -30, "init": -180, "offset": 270, "dir": -1.0},  # Joint 0 (Shoulder) - 硬體: 30 ~ 210度
             {"length": 0.11,       "min_angle": -240, "max_angle": 0,   "init": -0,   "offset": -120, "dir": -1.0},  # Joint 1 (Elbow) - 硬體: 0 ~ 240度
             {"length": 0.00,       "min_angle": 168,  "max_angle": 240, "init": 240,  "offset": 0.0,  "dir": 1.0},   # Joint 2 (Gripper) - 硬體: 168 ~ 240度
         ]

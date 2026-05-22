@@ -451,8 +451,7 @@ class DoorOpenTask:
     def _state_arm_aim(self):
         if self._iter == 0:
             print("[State 4] 夾爪張開，準備移動手臂…")
-            gripper_max = self.arm.joint_limits[2]["max_angle"]
-            self.arm.set_last_joint_angle(gripper_max)
+            self.arm.set_last_joint_angle(70.0) # PyBullet 模擬器極限張開
             self._iter = 1
             time.sleep(0.3)
 
@@ -471,16 +470,14 @@ class DoorOpenTask:
         z_above  = z_target + PRESS_ABOVE_OFFSET
         
         try:
-            print("[State 4] 步驟1: 靠近車身並舉高 (將 Shoulder 角度設為接近極限大) 避免卡住門把")
-            # 內部角度的 min_angle 會在硬體輸出時變成硬體極限大
-            shoulder_max_hw = self.arm.joint_limits[0]["min_angle"]
-            elbow_max_hw = self.arm.joint_limits[1]["min_angle"]
-            
-            self.arm._smooth_move_to([shoulder_max_hw, elbow_max_hw, None], step=3.0, delay=0.05)
+            print("[State 4] 步驟1: 靠近車身並舉高 (由 PyBullet 規劃收縮姿態) 避免卡住門把")
+            retract_pos = [0.05, 0.0, 0.15]
+            self.arm.move_to_position(retract_pos)
             time.sleep(0.3)
 
             print(f"[State 4] 步驟2: 移到門把正上方 (X={x_above:.3f}m, Z={z_above:.3f}m)")
-            self.arm.move_to_2d_position(x_above, z_above, step=3.0, delay=0.05)
+            above_pos = [x_above, 0.0, z_above]
+            self.arm.move_to_position(above_pos)
             
             self._last_knob_x = x_target
             self._last_knob_z = z_target
@@ -508,22 +505,17 @@ class DoorOpenTask:
     def _state_press_down(self):
         if self._press_count == 0:
             print("[State 5] 夾爪合起，壓住門把…")
-            gripper_min = self.arm.joint_limits[2]["min_angle"]
-            self.arm.set_last_joint_angle(gripper_min)  # 夾爪合攏至極限
+            self.arm.set_last_joint_angle(10.0)  # PyBullet 極限合攏
             time.sleep(0.1)
-            self.arm.set_last_joint_angle(gripper_min + 2.0)  # 自動退 2 度以防燒壞馬達
+            self.arm.set_last_joint_angle(12.0)  # 退 2 度以防燒壞馬達
             time.sleep(0.3)                       # 等待微調完成
 
             print(f"[State 5] 往下壓 {PRESS_Z_DOWN * 100:.1f}cm，目標: X={self._last_knob_x:.3f}m, Z={self._last_knob_z - PRESS_Z_DOWN:.3f}m")
 
             try:
                 # 直接一步壓到目標高度
-                self.arm.move_to_2d_position(
-                    self._last_knob_x,
-                    self._last_knob_z - PRESS_Z_DOWN,
-                    step=2.0,
-                    delay=0.05,
-                )
+                down_pos = [self._last_knob_x, 0.0, self._last_knob_z - PRESS_Z_DOWN]
+                self.arm.move_to_position(down_pos)
                 print("[State 5] 門把已壓下")
                 time.sleep(0.5)
                 self._transition(DoorOpenState.OPEN_DOOR)
@@ -569,10 +561,9 @@ class DoorOpenTask:
             self.rc.publish_target_label("")
             try:
                 print("[FSM] 釋放夾爪並重置手臂姿態…")
-                gripper_max = self.arm.joint_limits[2]["max_angle"]
-                self.arm.set_last_joint_angle(gripper_max) # 2D 鬆開夾爪（張開到最大）
+                self.arm.set_last_joint_angle(70.0) # 鬆開夾爪
                 time.sleep(0.5)
-                self.arm.reset_arm()                 # 回歸初始姿態
+                self.arm.reset_arm(all_angle_degrees=90.0)                 # 回歸初始姿態
             except Exception as e:
                 print(f"[FSM] 重置手臂失敗: {e}")
 

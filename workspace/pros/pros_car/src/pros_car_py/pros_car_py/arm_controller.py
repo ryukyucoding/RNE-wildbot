@@ -760,8 +760,6 @@ class ArmController:
 
     # 更新實體和虛擬
     def update_action(self, joint_pos):
-        print(f"update_action: {self.get_joint_angles()}")
-        
         # Pybullet controllable joints has 6 elements.
         # If joint_pos has length 5: [joint0, joint1, joint2, joint3, gripper]
         # We pad it to 6 joints for Pybullet: [joint0, joint1, joint2, joint3, 0.0 (wrist roll), gripper]
@@ -771,7 +769,22 @@ class ArmController:
             pybullet_joint_pos = joint_pos
             
         self.ik_solver.setJointPosition(pybullet_joint_pos)
-        self.ros_communicator.publish_robot_arm_angle(joint_pos)
+        
+        # --- 硬體保護映射 ---
+        # 實體車的夾爪安全範圍為 168° ~ 240°，但 PyBullet 模擬器是 10° ~ 70°
+        # 在發布給實體 ROS 前，將模擬器的角度映射為硬體角度，以防燒毀馬達
+        hardware_joint_pos = list(joint_pos)
+        if len(hardware_joint_pos) > 0:
+            gripper_deg = math.degrees(hardware_joint_pos[-1])
+            # 線性映射: 10度 -> 168度, 70度 -> 240度
+            # 若小於 10 或大於 70，也會跟著等比例外推，但建議源頭已經 clamp 過
+            mapped_hw_deg = 168.0 + (gripper_deg - 10.0) * (240.0 - 168.0) / (70.0 - 10.0)
+            
+            # 強制安全限制 (防呆)
+            mapped_hw_deg = max(168.0, min(mapped_hw_deg, 240.0))
+            hardware_joint_pos[-1] = math.radians(mapped_hw_deg)
+
+        self.ros_communicator.publish_robot_arm_angle(hardware_joint_pos)
 
     def clamp(self, value, min_value, max_value):
         """
