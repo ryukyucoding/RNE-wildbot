@@ -469,10 +469,18 @@ class DoorOpenTask:
         z_target = KNOB_Z_HEIGHT
         x_above  = x_target
         z_above  = z_target + PRESS_ABOVE_OFFSET
-        print(f"[State 4] 移到正上方: X={x_above:.3f}m, Z={z_above:.3f}m")
+        
+        x_retract = 0.05
+        z_retract = 0.15
 
         try:
+            print(f"[State 4] 步驟1: 靠近車身並舉高 (X={x_retract:.3f}m, Z={z_retract:.3f}m) 避免卡住門把")
+            self.arm.move_to_2d_position(x_retract, z_retract, step=3.0, delay=0.05)
+            time.sleep(0.3)
+
+            print(f"[State 4] 步驟2: 移到門把正上方 (X={x_above:.3f}m, Z={z_above:.3f}m)")
             self.arm.move_to_2d_position(x_above, z_above, step=3.0, delay=0.05)
+            
             self._last_knob_x = x_target
             self._last_knob_z = z_target
             print("[State 4] 手臂已到達門把正上方，準備下壓")
