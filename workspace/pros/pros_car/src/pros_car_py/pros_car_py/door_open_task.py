@@ -472,12 +472,11 @@ class DoorOpenTask:
         
         try:
             print("[State 4] 步驟1: 靠近車身並舉高 (將 Shoulder 角度設為接近極限大) 避免卡住門把")
-            # 內部角度的 min_angle (-210) 會在硬體輸出時乘以 dir(-1.0) 變成 210 度 (硬體極限大)
+            # 內部角度的 min_angle 會在硬體輸出時變成硬體極限大
             shoulder_max_hw = self.arm.joint_limits[0]["min_angle"]
-            # 稍微收折 Elbow 避免碰撞
-            elbow_fold = self.arm.joint_limits[1]["min_angle"] / 2.0 
+            elbow_max_hw = self.arm.joint_limits[1]["min_angle"]
             
-            self.arm._smooth_move_to([shoulder_max_hw, elbow_fold, None], step=3.0, delay=0.05)
+            self.arm._smooth_move_to([shoulder_max_hw, elbow_max_hw, None], step=3.0, delay=0.05)
             time.sleep(0.3)
 
             print(f"[State 4] 步驟2: 移到門把正上方 (X={x_above:.3f}m, Z={z_above:.3f}m)")
