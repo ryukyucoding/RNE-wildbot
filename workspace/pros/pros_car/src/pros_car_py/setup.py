@@ -29,6 +29,7 @@ setup(
             "crane_writer = pros_car_py.crane_writer:main",
             "arm_test = pros_car_py.arm_test:main",
             "lidar_trans = pros_car_py.lidar_trans:main",
+            "door_open = pros_car_py.door_open_task:main",
         ],
     },
 )

@@ -45,3 +45,8 @@ AMENT_IGNORE
 
 # SSH keys
 ssh/
+
+# YOLO model weights
+*.pt
+*.pth
+*.weights

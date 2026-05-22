@@ -34,15 +34,96 @@ class ArmController:
         # 動態定義所有關節 (加入 length 臂長 與 angle_offset 角度補償)
         # angle_offset: IK 算出來的數學 0 度可能不是 Unity 的 0 度，可透過這個補償
         self.joint_limits = [
-            {"length": 0.08089007, "min_angle": -180, "max_angle": 0, "init": -180, "offset": 270, "dir": -1.0},  # Joint 0 (Shoulder)
-            {"length": 0.11, "min_angle": -240, "max_angle": 0, "init": -0,   "offset": -120, "dir": -1.0},  # Joint 1 (Elbow)
-            {"length": 0.00, "min_angle": 20, "max_angle": 90,  "init": 90,  "offset": 0.0, "dir": 1.0},  # Joint 2 (Gripper)
+            {"length": 0.08089007, "min_angle": -210, "max_angle": -30, "init": -180, "offset": 270, "dir": -1.0},  # Joint 0 (Shoulder) - 硬體: 30 ~ 210度
+            {"length": 0.11,       "min_angle": -240, "max_angle": 0,   "init": -0,   "offset": -120, "dir": -1.0},  # Joint 1 (Elbow) - 硬體: 0 ~ 240度
+            {"length": 0.00,       "min_angle": 168,  "max_angle": 240, "init": 240,  "offset": 0.0,  "dir": 1.0},   # Joint 2 (Gripper) - 硬體: 168 ~ 240度
         ]
         
         self.joint_angles = [joint["init"] for joint in self.joint_limits]
         self.manual_step = 3.0   
         
         print(f"🦾 Arm Controller Initialized: {len(self.joint_limits)} Joints Managed.")
+
+    # ==========================================
+    # Helper Methods for Door Opening Task FSM
+    # ==========================================
+    def ensure_joint_pos_initialized(self):
+        """Dummy method for FSM compatibility."""
+        pass
+
+    def set_last_joint_angle(self, target_angle):
+        """設定夾爪角度 (Joint 2)"""
+        min_angle = self.joint_limits[2]["min_angle"]
+        max_angle = self.joint_limits[2]["max_angle"]
+        clamped_angle = max(min(target_angle, max_angle), min_angle)
+        
+        # 紀錄改變前的狀態
+        old_joints = [self.joint_angles[0], self.joint_angles[1], self.joint_angles[2]]
+        
+        self.joint_angles[2] = clamped_angle
+        
+        print("----------------------------------------")
+        print(f"🦾 [夾爪控制] 發布到馬達的實際數值 (Hardware Limits & Radians):")
+        names = ["Shoulder", "Elbow", "Gripper"]
+        for i in range(3):
+            dir_mult = self.joint_limits[i].get("dir", 1.0)
+            old_hw_deg = old_joints[i] * dir_mult
+            new_hw_deg = self.joint_angles[i] * dir_mult
+            old_rad = math.radians(old_hw_deg)
+            new_rad = math.radians(new_hw_deg)
+            print(f"  [Joint {i} - {names[i]:<8}] 目前: {old_hw_deg:>6.1f}° ({old_rad:>4.2f} rad) -> 目標: {new_hw_deg:>6.1f}° ({new_rad:>4.2f} rad)")
+        print("----------------------------------------")
+        
+        self._clamp_and_publish()
+
+    def move_to_2d_position(self, x, z, step=5.0, delay=0.1):
+        """計算 2D 逆運動學並平滑移動手臂到目標 (x, z) 座標"""
+        deg1, deg2 = self._calculate_2d_ik(x, z)
+        # 保持夾爪角度不動，只移動前兩個旋轉關節
+        self._smooth_move_to([deg1, deg2, None], step=step, delay=delay)
+
+    def get_target_relative_coords(self):
+        """獲取目標（YOLO 偵測到的 knob）相對於手臂基座的 2D 座標 (x, z)"""
+        # 優先使用實體 YOLO 發布的 /yolo/detection/position (PointStamped)
+        target_msg = self.ros_communicator.get_latest_yolo_detection_position()
+        
+        # 如果沒有，則退而求其次使用 /yolo/target_marker (Marker)
+        if target_msg is None:
+            target_msg = self.ros_communicator.latest_yolo_marker
+            
+        if not target_msg:
+            return None
+            
+        target_map = PointStamped()
+        target_map.header.frame_id = target_msg.header.frame_id
+        target_map.header.stamp = self.ros_communicator.get_clock().now().to_msg()
+        
+        # 根據消息類型提取座標點
+        if hasattr(target_msg, 'point'):
+            target_map.point = target_msg.point
+        elif hasattr(target_msg, 'pose'):
+            target_map.point = target_msg.pose.position
+        else:
+            return None
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_link_name,
+                target_map.header.frame_id,
+                rclpy.time.Time()
+            )
+            target_base = tf2_geometry_msgs.do_transform_point(target_map, transform)
+            return target_base.point.x, target_base.point.z
+        except Exception as e:
+            print(f"⚠️ 座標轉換或 TF 失敗: {e}")
+            return None
+
+    def reset_arm(self):
+        """重置手臂到初始姿態"""
+        self.joint_angles = [joint["init"] for joint in self.joint_limits]
+        self._clamp_and_publish()
+        self._visualize_arm_lines()
+        print("手臂已重置為初始角度。")
 
     # ==========================================
     # 2. 手動控制邏輯 (Manual Control)
@@ -206,6 +287,15 @@ class ArmController:
         - step: 每次更新的最大度數 (越小越滑順)
         - delay: 每次更新間隔的時間 (越大越慢)
         """
+        print("----------------------------------------")
+        print("🦾 [手臂移動] 啟動平滑移動，發布到馬達的目標數值:")
+        names = ["Shoulder", "Elbow", "Gripper"]
+        for i in range(3):
+            if target_angles[i] is not None:
+                hw_deg = target_angles[i] * self.joint_limits[i].get("dir", 1.0)
+                hw_rad = math.radians(hw_deg)
+                print(f"  [Joint {i} - {names[i]:<8}] -> 目標: {hw_deg:>6.1f}° ({hw_rad:>4.2f} rad)")
+        print("----------------------------------------")
         while True:
             all_reached = True
             
@@ -247,8 +337,9 @@ class ArmController:
                 return cand # 找到合法的同界角，直接回傳！
                 
         # 如果加減 360 度後都不在範圍內，代表這個姿勢真的超出了手臂極限。
-        # 我們先回傳原始角度，後續交給 _clamp_and_publish 去強制卡在邊界防呆。
-        return angle
+        # 為了避免 _smooth_move_to 陷入死迴圈，我們直接把它 clamp 到最近的極限值
+        closest_cand = min(candidates, key=lambda c: min(abs(c - min_limit), abs(c - max_limit)))
+        return max(min_limit, min(max_limit, closest_cand))
     # ==========================================
     # 5. 視覺化手臂 (Foxglove Lines)
     # ==========================================

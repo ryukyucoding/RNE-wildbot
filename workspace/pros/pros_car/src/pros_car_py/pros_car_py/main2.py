@@ -7,7 +7,7 @@ import io
 import sys
 from pros_car_py.joint_config import JOINT_UPDATES_POSITIVE, JOINT_UPDATES_NEGATIVE
 from pros_car_py.car_controller import CarController
-from pros_car_py.arm_controller_2D import ArmController
+from pros_car_py.arm_controller import ArmController
 from pros_car_py.data_processor import DataProcessor
 from pros_car_py.nav_processing import Nav2Processing
 from pros_car_py.ros_communicator import RosCommunicator
@@ -31,7 +31,7 @@ def main():
     nav2_processing = Nav2Processing(ros_communicator, data_processor)
     ik_solver = PybulletRobotController(end_eff_index=5)
     car_controller = CarController(ros_communicator, nav2_processing)
-    arm_controller = ArmController(ros_communicator, data_processor)
+    arm_controller = ArmController(ros_communicator, data_processor, ik_solver)
     crane_controller = CraneController(
         ros_communicator, data_processor, ik_solver, num_joints=7
     )
