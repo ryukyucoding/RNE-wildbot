@@ -56,9 +56,22 @@ class ArmController:
         min_angle = self.joint_limits[2]["min_angle"]
         max_angle = self.joint_limits[2]["max_angle"]
         clamped_angle = max(min(target_angle, max_angle), min_angle)
+        
+        # 紀錄改變前的狀態
+        old_j0 = self.joint_angles[0]
+        old_j1 = self.joint_angles[1]
+        old_j2 = self.joint_angles[2]
+        
         self.joint_angles[2] = clamped_angle
+        
+        print("----------------------------------------")
+        print(f"🦾 [夾爪控制] 關節狀態更新:")
+        print(f"  [Joint 0 - Shoulder] 目前: {old_j0:.1f}° -> 目標: {self.joint_angles[0]:.1f}°")
+        print(f"  [Joint 1 - Elbow]    目前: {old_j1:.1f}° -> 目標: {self.joint_angles[1]:.1f}°")
+        print(f"  [Joint 2 - Gripper]  目前: {old_j2:.1f}° -> 目標: {self.joint_angles[2]:.1f}°")
+        print("----------------------------------------")
+        
         self._clamp_and_publish()
-        print(f"Gripper angle set to {clamped_angle} degrees.")
 
     def move_to_2d_position(self, x, z, step=5.0, delay=0.1):
         """計算 2D 逆運動學並平滑移動手臂到目標 (x, z) 座標"""
