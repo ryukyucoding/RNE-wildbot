@@ -451,7 +451,7 @@ class DoorOpenTask:
     def _state_arm_aim(self):
         if self._iter == 0:
             print("[State 4] 夾爪張開，準備移動手臂…")
-            self.arm.set_last_joint_angle(90.0)
+            self.arm.set_last_joint_angle(240.0)
             self._iter = 1
             time.sleep(0.3)
 
@@ -498,8 +498,10 @@ class DoorOpenTask:
     def _state_press_down(self):
         if self._press_count == 0:
             print("[State 5] 夾爪合起，壓住門把…")
-            self.arm.set_last_joint_angle(20.0)   # 夾爪合攏（20度）
-            time.sleep(0.8)                       # 等待夾爪咬合
+            self.arm.set_last_joint_angle(168.0)  # 夾爪合攏至極限（168度）
+            time.sleep(0.5)                       # 等待 0.5 秒
+            self.arm.set_last_joint_angle(170.0)  # 自動退 2 度以防燒壞馬達
+            time.sleep(0.3)                       # 等待微調完成
 
             print(f"[State 5] 往下壓 {PRESS_Z_DOWN * 100:.1f}cm，目標: X={self._last_knob_x:.3f}m, Z={self._last_knob_z - PRESS_Z_DOWN:.3f}m")
 
@@ -556,7 +558,7 @@ class DoorOpenTask:
             self.rc.publish_target_label("")
             try:
                 print("[FSM] 釋放夾爪並重置手臂姿態…")
-                self.arm.set_last_joint_angle(90.0)  # 2D 鬆開夾爪（張開到最大為 90度）
+                self.arm.set_last_joint_angle(240.0) # 2D 鬆開夾爪（張開到最大為 240度）
                 time.sleep(0.5)
                 self.arm.reset_arm()                 # 回歸初始姿態
             except Exception as e:
