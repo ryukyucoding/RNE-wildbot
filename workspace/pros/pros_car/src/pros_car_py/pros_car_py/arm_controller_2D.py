@@ -15,6 +15,16 @@ import numpy as np
 import threading
 import rclpy
 
+# ==========================================
+# 模擬器相容模式
+# ==========================================
+# 由於實體車的夾爪硬體角度範圍為 168°~240°，
+# 但虛擬環境 (Unity) 原始設計是以 20°~90° 為基準。
+# 若此處為 True，發布給 ROS 前會自動將硬體角度映射回虛擬環境，避免畫面顯示「夾爪反折」。
+# 💡 上實體車測試時，請務必改為 False！
+SIMULATION_MODE = True
+
+
 
 class ArmController:
     def __init__(self, ros_communicator, data_processor):
@@ -277,7 +287,9 @@ class ArmController:
         deg1 = self._normalize_angle(deg1, self.joint_limits[0]["min_angle"], self.joint_limits[0]["max_angle"])
         deg2 = self._normalize_angle(deg2, self.joint_limits[1]["min_angle"], self.joint_limits[1]["max_angle"])
         
-        print(f"🧮 IK 計算完成: Shoulder={deg1:.1f}°, Elbow={deg2:.1f}°")
+        hw_deg1 = deg1 * self.joint_limits[0].get("dir", 1.0)
+        hw_deg2 = deg2 * self.joint_limits[1].get("dir", 1.0)
+        print(f"🧮 IK 計算完成: Shoulder={hw_deg1:.1f}° (內部={deg1:.1f}°), Elbow={hw_deg2:.1f}° (內部={deg2:.1f}°)")
         return deg1, deg2
     
     def _smooth_move_to(self, target_angles, step=2.0, delay=0.05):
@@ -380,4 +392,12 @@ class ArmController:
             math.radians(float(self.joint_angles[i]) * self.joint_limits[i].get("dir", 1.0)) 
             for i in range(len(self.joint_angles))
         ]
+        
+        # 如果是在模擬器中，將夾爪的實體角度(168~240)映射回虛擬模型的視覺角度(20~90)
+        if getattr(self, "SIMULATION_MODE", SIMULATION_MODE):
+            hw_deg = self.joint_angles[2] * self.joint_limits[2].get("dir", 1.0)
+            # 線性映射：168 -> 20, 240 -> 90
+            unity_deg = 20.0 + (hw_deg - 168.0) * (90.0 - 20.0) / (240.0 - 168.0)
+            joint_pos_radians[2] = math.radians(unity_deg)
+
         self.ros_communicator.publish_robot_arm_angle(joint_pos_radians)
