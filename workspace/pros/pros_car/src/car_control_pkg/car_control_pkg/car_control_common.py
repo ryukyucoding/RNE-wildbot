@@ -1,5 +1,7 @@
 import rclpy
 import tf2_ros
+import time
+from rclpy.duration import Duration
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String
 from geometry_msgs.msg import PoseStamped, Twist
@@ -73,8 +75,8 @@ class BaseCarControlNode(Node):
             CarControlPublishers.create_publishers(self)
         )
 
-        # Publisher to clear the plan topic
-        self.plan_clear_pub = self.create_publisher(Path, '/plan', 10)
+        # Publisher to clear the global plan topic (matches pros_car_py / Nav2 stack)
+        self.plan_clear_pub = self.create_publisher(Path, '/received_global_plan', 10)
         self.goal_clear_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
 
         # Create subscription to control signals
@@ -105,13 +107,23 @@ class BaseCarControlNode(Node):
         self.declare_parameter("bridge_foot_yaw", 0.0)      # degrees
         self.declare_parameter("bridge_heading_deg", 0.0)   # degrees
         self.declare_parameter("foot_reached_thresh_m", 0.3)
+        self.declare_parameter("foot_reached_hold_sec", 1.0)
+        self.declare_parameter("foot_min_approach_dist_m", 0.5)
         self.declare_parameter("align_tol_deg", 8.0)
-        self.declare_parameter("cross_up_sec", 3.0)
-        self.declare_parameter("cross_platform_sec", 2.0)
-        self.declare_parameter("cross_down_sec", 3.0)
+        # Open-loop crossing: odom distance along bridge heading (SLAM drifts on ramp).
+        self.declare_parameter("cross_up_dist_m", 0.7)
+        self.declare_parameter("cross_platform_dist_m", 1.05)
+        self.declare_parameter("cross_down_dist_m", 0.7)
+        self.declare_parameter("cross_segment_max_sec", 20.0)
+        self.declare_parameter("cross_stuck_time_sec", 2.5)
+        self.declare_parameter("cross_min_progress_m", 0.04)
+        # Legacy time caps (used only as fallback if odom TF unavailable).
+        self.declare_parameter("cross_up_sec", 6.0)
+        self.declare_parameter("cross_platform_sec", 5.0)
+        self.declare_parameter("cross_down_sec", 5.0)
         self.declare_parameter("cross_up_action", "FORWARD")
-        self.declare_parameter("cross_platform_action", "FORWARD_SLOW")
-        self.declare_parameter("cross_down_action", "FORWARD_SLOW")
+        self.declare_parameter("cross_platform_action", "FORWARD")
+        self.declare_parameter("cross_down_action", "FORWARD")
 
     def get_bridge_params(self):
         """Return the Bridge_Nav parameters as a plain dict."""
@@ -121,7 +133,21 @@ class BaseCarControlNode(Node):
             "foot_yaw": float(self.get_parameter("bridge_foot_yaw").value),
             "heading_deg": float(self.get_parameter("bridge_heading_deg").value),
             "foot_thresh": float(self.get_parameter("foot_reached_thresh_m").value),
+            "foot_hold_sec": float(
+                self.get_parameter("foot_reached_hold_sec").value
+            ),
+            "foot_min_approach": float(
+                self.get_parameter("foot_min_approach_dist_m").value
+            ),
             "align_tol": float(self.get_parameter("align_tol_deg").value),
+            "up_dist": float(self.get_parameter("cross_up_dist_m").value),
+            "platform_dist": float(self.get_parameter("cross_platform_dist_m").value),
+            "down_dist": float(self.get_parameter("cross_down_dist_m").value),
+            "cross_max_sec": float(self.get_parameter("cross_segment_max_sec").value),
+            "cross_stuck_sec": float(self.get_parameter("cross_stuck_time_sec").value),
+            "cross_min_progress": float(
+                self.get_parameter("cross_min_progress_m").value
+            ),
             "up_sec": float(self.get_parameter("cross_up_sec").value),
             "platform_sec": float(self.get_parameter("cross_platform_sec").value),
             "down_sec": float(self.get_parameter("cross_down_sec").value),
@@ -131,7 +157,7 @@ class BaseCarControlNode(Node):
         }
 
     def publish_goal_pose(self, x, y, yaw_deg=0.0):
-        """Publish a navigation goal (PoseStamped, frame 'map') to /goal_pose for Nav2."""
+        """Publish bridge foot goal to /goal_pose; Nav2 relays plan on /received_global_plan."""
         goal = PoseStamped()
         goal.header.stamp = self.get_clock().now().to_msg()
         goal.header.frame_id = "map"
@@ -141,7 +167,10 @@ class BaseCarControlNode(Node):
         yaw = math.radians(yaw_deg)
         goal.pose.orientation.z = math.sin(yaw / 2.0)
         goal.pose.orientation.w = math.cos(yaw / 2.0)
-        self.goal_clear_pub.publish(goal)
+        # Publish several times so bt_navigator reliably receives the goal.
+        for _ in range(5):
+            self.goal_clear_pub.publish(goal)
+            time.sleep(0.1)
         self.latest_goal_pose = goal
         self.get_logger().info(
             f"Published bridge foot goal to /goal_pose: ({x:.2f}, {y:.2f}, yaw={yaw_deg:.1f} deg)"
@@ -169,16 +198,16 @@ class BaseCarControlNode(Node):
 
     def clear_plan(self):
         """
-        Clear the /plan topic by publishing an empty Path message
+        Clear /received_global_plan by publishing an empty Path message
         and resetting internal stored plan.
         """
         empty = Path()
         empty.header.stamp = self.get_clock().now().to_msg()
-        empty.header.frame_id = ''
+        empty.header.frame_id = 'map'
         empty.poses = []
         self.plan_clear_pub.publish(empty)
         self.latest_global_plan = None
-        self.get_logger().info('Cleared /plan topic')
+        self.get_logger().info('Cleared /received_global_plan topic')
 
     def _create_navigation_subscribers(self):
         """Create all subscribers needed for navigation"""
@@ -187,7 +216,7 @@ class BaseCarControlNode(Node):
         )
 
         self.plan_sub = self.create_subscription(
-            Path, "/plan", self._global_plan_callback, 1
+            Path, "/received_global_plan", self._global_plan_callback, 1
         )
 
         self.cmd_vel_sub = self.create_subscription(
@@ -299,13 +328,33 @@ class BaseCarControlNode(Node):
         """
         try:
             t = self.tf_buffer.lookup_transform(
-                "map", "base_footprint", rclpy.time.Time()
+                "map",
+                "base_footprint",
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.5),
             )
             return t.transform.translation, t.transform.rotation
         except Exception as e:
             self.get_logger().warn(
                 f"TF lookup map→base_footprint failed: {e}",
                 throttle_duration_sec=1.0,
+            )
+            return None, None
+
+    def get_odom_position_and_orientation(self):
+        """Odom pose — reliable on the bridge when SLAM map matching fails."""
+        try:
+            t = self.tf_buffer.lookup_transform(
+                "odom",
+                "base_footprint",
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.5),
+            )
+            return t.transform.translation, t.transform.rotation
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup odom→base_footprint failed: {e}",
+                throttle_duration_sec=2.0,
             )
             return None, None
 

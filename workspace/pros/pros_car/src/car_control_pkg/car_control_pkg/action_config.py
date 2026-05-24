@@ -6,11 +6,14 @@ vel, rotate_vel為自走車PID數值, 可於arduino程式碼查看
 
 前左、前右、後左、後右
 """
-vel = 10.0
-vel_slow = 3.0
-rotate_vel = 10.0
-rotate_vel_slow = 2.0
-rotate_vel_median = 5.0
+# Match pros_car_py/ros_communicator_config.py — Unity needs ~50× real-robot
+# values to overcome sim friction; robot_control uses the same scale.
+speed_ratio = 50
+vel = 6.0 * speed_ratio
+vel_slow = 3.0 * speed_ratio
+rotate_vel = 9.0 * speed_ratio
+rotate_vel_slow = 7.0 * speed_ratio
+rotate_vel_median = 8.0 * speed_ratio
 ACTION_MAPPINGS = {
     "FORWARD": [vel, vel, vel, vel],  # 前進
     "FORWARD_SLOW": [vel_slow, vel_slow, vel_slow, vel_slow],  # 前進

@@ -23,6 +23,8 @@ class DataProcessor:
 
     def get_processed_amcl_pose(self):
         amcl_pose_msg = self.ros_communicator.get_latest_amcl_pose()
+        if amcl_pose_msg is None:
+            return None
         position = amcl_pose_msg.pose.pose.position
         orientation = amcl_pose_msg.pose.pose.orientation
         pose = [position.x, position.y, position.z]
@@ -265,10 +267,13 @@ class DataProcessor:
         distance_to_goal = math.sqrt((last_x - goal_x) ** 2 + (last_y - goal_y) ** 2)
 
         # 如果該條路徑的末端有靠近終點就當成是成功的路徑
-        if distance_to_goal < 0.2:
+        # Threshold 0.5m: Nav2 global planner often stops short of the exact
+        # goal due to robot footprint inflation, so 0.2m was too strict.
+        if distance_to_goal < 0.5:
             self.ros_communicator.publish_confirmed_initial_plan(
                 received_global_plan_msg
             )
             return received_global_plan_msg
         else:
+            print(f"[get_plan] STOP — plan endpoint {distance_to_goal:.2f}m from goal (need < 0.5m)")
             return None

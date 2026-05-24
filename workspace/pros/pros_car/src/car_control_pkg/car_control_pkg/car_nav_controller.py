@@ -5,6 +5,7 @@ from car_control_pkg.nav2_utils import (
 )
 from action_interface.action import NavGoal
 import time
+import math
 
 class NavigationController:
     def __init__(self, car_control_node):
@@ -55,24 +56,95 @@ class NavigationController:
         """Initialise state for a fresh Bridge_Nav run."""
         self.index = 0
         self.bridge_phase = "APPROACH"
-        self.bridge_goal_published = False
         self.bridge_seg_start = None
+        self.bridge_seg_odom_start = None
+        self.bridge_seg_last_progress = 0.0
+        self.bridge_seg_last_progress_time = time.monotonic()
+        self.bridge_foot_close_since = None
+        self.bridge_max_approach_dist = 0.0
         self.bridge_params = self.car_control_node.get_bridge_params()
         self.car_control_node.get_logger().info(
             f"Bridge_Nav reset; params={self.bridge_params}"
         )
 
     @staticmethod
+    def _heading_unit_vector(heading_deg):
+        yaw = math.radians(heading_deg)
+        return math.cos(yaw), math.sin(yaw)
+
+    @staticmethod
+    def _along_heading_progress(start_xy, current_xy, heading_deg):
+        ux, uy = NavigationController._heading_unit_vector(heading_deg)
+        dx = current_xy[0] - start_xy[0]
+        dy = current_xy[1] - start_xy[1]
+        return dx * ux + dy * uy
+
+    def _start_cross_segment(self, node):
+        self.bridge_seg_start = time.time()
+        self.bridge_seg_last_progress = 0.0
+        self.bridge_seg_last_progress_time = time.monotonic()
+        pos, _ = node.get_odom_position_and_orientation()
+        if pos is not None:
+            self.bridge_seg_odom_start = (pos.x, pos.y)
+        else:
+            self.bridge_seg_odom_start = None
+
+    def _cross_segment_progress(self, node, heading_deg):
+        if self.bridge_seg_odom_start is None:
+            return None
+        pos, _ = node.get_odom_position_and_orientation()
+        if pos is None:
+            return None
+        return self._along_heading_progress(
+            self.bridge_seg_odom_start, (pos.x, pos.y), heading_deg
+        )
+
+    def _update_cross_progress(self, progress, min_progress, stuck_sec):
+        if progress is None:
+            return False
+        if progress >= self.bridge_seg_last_progress + min_progress:
+            self.bridge_seg_last_progress = progress
+            self.bridge_seg_last_progress_time = time.monotonic()
+        return (time.monotonic() - self.bridge_seg_last_progress_time) > stuck_sec
+
+    def _advance_cross_segment(self, node, phase, next_phase, progress, target_dist):
+        node.get_logger().info(
+            f"Bridge_Nav: {phase} done (odom={progress:.2f}/{target_dist:.2f} m) -> {next_phase}"
+        )
+        self.bridge_phase = next_phase
+        if next_phase != "DONE":
+            self._start_cross_segment(node)
+
+    @staticmethod
     def _normalize_deg(angle):
         """Normalise an angle in degrees to [-180, 180)."""
         return (angle + 180.0) % 360.0 - 180.0
+
+    def _choose_drive_action(self, diff_angle, forward_thresh=20.0, median_thresh=30.0):
+        """
+        Turn toward a target bearing, then drive forward when aligned.
+        Used by APPROACH (bearing to foot) and manual path follow.
+        """
+        if -forward_thresh < diff_angle < forward_thresh:
+            return "FORWARD"
+        if diff_angle > 0:
+            return (
+                "COUNTERCLOCKWISE_ROTATION_MEDIAN"
+                if diff_angle < median_thresh
+                else "COUNTERCLOCKWISE_ROTATION"
+            )
+        return (
+            "CLOCKWISE_ROTATION_MEDIAN"
+            if diff_angle > -median_thresh
+            else "CLOCKWISE_ROTATION"
+        )
 
     def bridge_nav(self):
         """
         One tick of the bridge-crossing state machine. Returns None while the
         mission is ongoing and a NavGoal.Result when finished.
 
-        Phases: APPROACH (Nav2 -> foot) -> ALIGN (rotate to bridge heading)
+        Phases: APPROACH (drive to foot) -> ALIGN (rotate to bridge heading)
         -> CROSS_UP / CROSS_PLATFORM / CROSS_DOWN (open-loop timed) -> DONE.
         """
         if not hasattr(self, "bridge_phase"):
@@ -82,42 +154,58 @@ class NavigationController:
         node = self.car_control_node
 
         if self.bridge_phase == "APPROACH":
-            # Publish the foot goal once so Nav2 plans a path to it.
-            if not self.bridge_goal_published:
-                node.publish_goal_pose(p["foot_x"], p["foot_y"], p["foot_yaw"])
-                self.bridge_goal_published = True
-                return None
-
+            # Direct bearing navigation to the foot (wheels only — no /goal_pose so
+            # Nav2 bt_navigator does not also publish conflicting /cmd_vel).
             car_position, car_orientation = node.get_car_position_and_orientation()
-            if car_position is None:
+            if car_position is None or car_orientation is None:
+                node.get_logger().warn(
+                    "APPROACH: waiting for TF map→base_footprint...",
+                    throttle_duration_sec=2.0,
+                )
                 return None
 
             dist = cal_distance(
                 [car_position.x, car_position.y], [p["foot_x"], p["foot_y"]]
             )
-            if dist < p["foot_thresh"]:
-                node.publish_control("STOP")
-                self.bridge_phase = "ALIGN"
-                node.get_logger().info(
-                    f"Bridge_Nav: reached foot (dist={dist:.2f} m); aligning"
-                )
-                return None
+            self.bridge_max_approach_dist = max(self.bridge_max_approach_dist, dist)
 
-            # Follow the Nav2 global plan toward the foot.
-            path_points = node.get_path_points()
-            if not path_points:
-                return None
-            target_points, _ = self.get_next_target_point(
-                [car_position.x, car_position.y], path_points
-            )
-            if target_points is None:
-                return None
+            if (
+                dist < p["foot_thresh"]
+                and self.bridge_max_approach_dist >= p["foot_min_approach"]
+            ):
+                if self.bridge_foot_close_since is None:
+                    self.bridge_foot_close_since = time.monotonic()
+                elif (
+                    time.monotonic() - self.bridge_foot_close_since
+                    >= p["foot_hold_sec"]
+                ):
+                    node.publish_control("STOP")
+                    self.bridge_phase = "ALIGN"
+                    self.bridge_foot_close_since = None
+                    node.get_logger().info(
+                        f"Bridge_Nav: reached foot (dist={dist:.2f} m, "
+                        f"held {p['foot_hold_sec']:.1f}s); aligning"
+                    )
+                    return None
+            else:
+                self.bridge_foot_close_since = None
+
             diff_angle = calculate_diff_angle(
                 [car_position.x, car_position.y],
                 [car_orientation.z, car_orientation.w],
-                target_points,
+                [p["foot_x"], p["foot_y"]],
             )
-            node.publish_control(self.choose_action(diff_angle))
+            action = self._choose_drive_action(diff_angle)
+            rotate = (
+                "forward"
+                if action == "FORWARD"
+                else ("CCW" if "COUNTER" in action else "CW")
+            )
+            node.get_logger().info(
+                f"APPROACH: dist={dist:.2f} m, bearing_err={diff_angle:.1f}° → {rotate}",
+                throttle_duration_sec=2.0,
+            )
+            node.publish_control(action)
             return None
 
         if self.bridge_phase == "ALIGN":
@@ -131,8 +219,10 @@ class NavigationController:
             if abs(diff) < p["align_tol"]:
                 node.publish_control("STOP")
                 self.bridge_phase = "CROSS_UP"
-                self.bridge_seg_start = time.time()
-                node.get_logger().info("Bridge_Nav: aligned; starting climb")
+                self._start_cross_segment(node)
+                node.get_logger().info(
+                    f"ALIGN: diff={diff:.1f}° → close enough; starting climb"
+                )
                 return None
             if diff > 0:
                 action = (
@@ -140,34 +230,86 @@ class NavigationController:
                     if abs(diff) < 30
                     else "COUNTERCLOCKWISE_ROTATION"
                 )
+                rotate_dir = "CCW"
             else:
                 action = (
                     "CLOCKWISE_ROTATION_MEDIAN"
                     if abs(diff) < 30
                     else "CLOCKWISE_ROTATION"
                 )
+                rotate_dir = "CW"
+            node.get_logger().info(
+                f"ALIGN: diff={diff:.1f}° → rotating {rotate_dir}",
+                throttle_duration_sec=2.0,
+            )
             node.publish_control(action)
             return None
 
         if self.bridge_phase in ("CROSS_UP", "CROSS_PLATFORM", "CROSS_DOWN"):
-            # (action, duration, next_phase) per timed segment.
             segments = {
-                "CROSS_UP": (p["up_action"], p["up_sec"], "CROSS_PLATFORM"),
+                "CROSS_UP": (p["up_action"], p["up_dist"], p["up_sec"], "CROSS_PLATFORM"),
                 "CROSS_PLATFORM": (
                     p["platform_action"],
+                    p["platform_dist"],
                     p["platform_sec"],
                     "CROSS_DOWN",
                 ),
-                "CROSS_DOWN": (p["down_action"], p["down_sec"], "DONE"),
+                "CROSS_DOWN": (
+                    p["down_action"],
+                    p["down_dist"],
+                    p["down_sec"],
+                    "DONE",
+                ),
             }
-            action, duration, next_phase = segments[self.bridge_phase]
+            action, target_dist, fallback_sec, next_phase = segments[self.bridge_phase]
             node.publish_control(action)
-            if time.time() - self.bridge_seg_start >= duration:
+
+            elapsed = time.time() - self.bridge_seg_start
+            progress = self._cross_segment_progress(node, p["heading_deg"])
+            stuck = self._update_cross_progress(
+                progress, p["cross_min_progress"], p["cross_stuck_sec"]
+            )
+
+            if progress is not None:
                 node.get_logger().info(
-                    f"Bridge_Nav: {self.bridge_phase} done -> {next_phase}"
+                    f"{self.bridge_phase}: odom={progress:.2f}/{target_dist:.2f} m, "
+                    f"t={elapsed:.1f}s",
+                    throttle_duration_sec=2.0,
+                )
+                if progress >= target_dist:
+                    self._advance_cross_segment(
+                        node, self.bridge_phase, next_phase, progress, target_dist
+                    )
+                    return None
+                if stuck:
+                    node.get_logger().warn(
+                        f"{self.bridge_phase}: no odom progress — still driving "
+                        f"(SLAM may drift on ramp)",
+                        throttle_duration_sec=2.0,
+                    )
+                if elapsed >= p["cross_max_sec"]:
+                    node.get_logger().warn(
+                        f"{self.bridge_phase}: max time {p['cross_max_sec']:.0f}s — "
+                        f"advancing at odom={progress:.2f} m"
+                    )
+                    self._advance_cross_segment(
+                        node, self.bridge_phase, next_phase, progress, target_dist
+                    )
+                return None
+
+            # Fallback when odom TF is missing: timed segments only.
+            node.get_logger().warn(
+                f"{self.bridge_phase}: odom unavailable — using timed fallback "
+                f"({fallback_sec:.0f}s)",
+                throttle_duration_sec=3.0,
+            )
+            if elapsed >= fallback_sec:
+                node.get_logger().info(
+                    f"Bridge_Nav: {self.bridge_phase} done (timed) -> {next_phase}"
                 )
                 self.bridge_phase = next_phase
-                self.bridge_seg_start = time.time()
+                if next_phase != "DONE":
+                    self._start_cross_segment(node)
             return None
 
         # DONE
@@ -252,17 +394,11 @@ class NavigationController:
             diff_angle = calculate_diff_angle(
                 car_position, car_orientation, target_points
             )
-            action_key = self.choose_action(diff_angle)
+            action_key = self._choose_drive_action(diff_angle)
             self.car_control_node.publish_control(action_key)
 
     def choose_action(self, diff_angle):
-        if diff_angle < 20 and diff_angle > -20:
-            action_key = "FORWARD"
-        elif diff_angle < -20 and diff_angle > -180:
-            action_key = "CLOCKWISE_ROTATION"
-        elif diff_angle > 20 and diff_angle < 180:
-            action_key = "COUNTERCLOCKWISE_ROTATION"
-        return action_key
+        return self._choose_drive_action(diff_angle)
 
     def get_next_target_point(
         self, car_position, path_points, min_required_distance=0.5

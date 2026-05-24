@@ -125,18 +125,28 @@ car_control_node:
     bridge_foot_yaw: 35.0       # 與 bridge_heading_deg 相同
     bridge_heading_deg: 35.0    # python3 計算出的角度
     foot_reached_thresh_m: 0.3
+    foot_reached_hold_sec: 1.0    # SLAM 在橋上會跳 — 需持續靠近 1s 才判定到達橋腳
+    foot_min_approach_dist_m: 0.5
     align_tol_deg: 8.0
-    cross_up_sec: 3.0           # ← 依實際橋長調整
-    cross_platform_sec: 2.0
-    cross_down_sec: 3.0
+    # 過橋段：以 odom 沿橋方向位移為主（SLAM 在坡道不可靠）
+    cross_up_dist_m: 0.7          # 上坡距離 — 依 Foxglove A→平台測量
+    cross_platform_dist_m: 1.05
+    cross_down_dist_m: 0.7
+    cross_segment_max_sec: 25.0
+    cross_stuck_time_sec: 2.5
+    cross_min_progress_m: 0.04
+    cross_up_sec: 8.0             # odom 不可用時的時間後備
+    cross_platform_sec: 8.0
+    cross_down_sec: 8.0
     cross_up_action: "FORWARD"
-    cross_platform_action: "FORWARD_SLOW"
-    cross_down_action: "FORWARD_SLOW"
+    cross_platform_action: "FORWARD"
+    cross_down_action: "FORWARD"
 ```
 
 > **調整提示：**
-> - `cross_*_sec`：用秒數 × 速度估橋長。在 Unity 先跑一次，依實際情況微調，再換到實體機。
-> - 上坡容易打滑 → 把 `cross_up_sec` 加長 + 保持 `FORWARD`（全速）。
+> - `cross_*_dist_m`：在 Foxglove 量 A→平台頂、平台長、下坡長（A→B 總長約 2.45 m 可拆成 0.7+1.05+0.7）。
+> - 上坡容易打滑 → 保持 `FORWARD`（全速）+ 調大 `cross_up_dist_m`。
+> - 看 log `CROSS_UP: odom=0.35/0.70 m` — 若卡在坡道 odom 不增加，會持續驅動直到距離達標或 `cross_segment_max_sec`。
 > - 下坡容易過快 → `cross_down_action: "FORWARD_SLOW"` + 適當縮短秒數。
 
 ---
@@ -164,15 +174,18 @@ ros2 run tf2_ros tf2_echo map base_footprint
 
 ### Terminal 2（啟動 bridge_nav）
 
+> **不要用** `./car_control.sh` 選單裡的 `robot_control` 或 Auto Navigation — 那些不是 Bridge_Nav。
+> 必須用下面的 `bridge_nav.launch.py`。
+
 ```bash
 cd /Users/albert/Desktop/114-2/RNE/Final_Project/RNE-wildbot/workspace/pros/pros_car
 ./car_control.sh
 ```
 
-容器內（如果前一步已經 `r` 過且程式碼沒改，可跳過 `r`）：
+容器內（程式碼有修改時必須 `r`）：
 
 ```bash
-r                                               # 有改程式碼才需要重新 build
+r                                               # colcon build + source
 ros2 launch car_control_pkg bridge_nav.launch.py
 ```
 
@@ -182,13 +195,16 @@ ros2 launch car_control_pkg bridge_nav.launch.py
 
 ### Terminal 3（觸發任務）
 
-**開新的 Terminal**，exec 進同一個 Docker 容器：
+> **重要：** `docker exec` 必須進入 **正在跑 `bridge_nav.launch.py` 的那個容器**（`docker ps` 看最新啟動的 `pros_car_docker_image`）。
+> 你有兩個 pros_car 容器時，送錯容器 = 任務不會動。
+
+**開新的 Terminal**，exec 進 **Terminal 2 同一個** Docker 容器：
 
 ```bash
-# 先找容器 ID
+# 先找容器 ID（選正在跑 bridge_nav 的那個，通常是最近 Created 的）
 docker ps
 
-# exec 進去（把 <CONTAINER_ID> 換成實際 ID，前幾個字元即可）
+# exec 進去（把 <CONTAINER_ID> 換成 cb90934c52f5 這類 ID）
 docker exec -it <CONTAINER_ID> bash
 ```
 
@@ -209,14 +225,19 @@ ros2 action send_goal /nav_action_server action_interface/action/NavGoal "{mode:
 
 ```
 Bridge_Nav reset; params={...}
-Published bridge foot goal to /goal_pose: (x, y, yaw=...)
-Bridge_Nav: reached foot (dist=... m); aligning
-Bridge_Nav: aligned; starting climb
+APPROACH: dist=1.10 m, bearing_err=35.0° → CCW
+APPROACH: dist=0.55 m, bearing_err=8.0° → forward
+Bridge_Nav: reached foot (dist=0.28 m); aligning
+ALIGN: diff=32.1° → rotating CW
+ALIGN: diff=...° → close enough; starting climb
 Bridge_Nav: CROSS_UP done -> CROSS_PLATFORM
 Bridge_Nav: CROSS_PLATFORM done -> CROSS_DOWN
 Bridge_Nav: CROSS_DOWN done -> DONE
 Bridge_Nav: bridge traversed
 ```
+
+若卡在 APPROACH，可能會看到（每 2 秒一次）：
+`APPROACH: waiting for global plan on /received_global_plan...`
 
 ---
 
@@ -233,11 +254,14 @@ Bridge_Nav: bridge traversed
 
 | 問題 | 可能原因 | 解法 |
 |------|----------|------|
-| APPROACH 一直等，車不動 | Nav2 沒收到 `/goal_pose` 或 SLAM 未啟動 | 確認 SLAM 在跑（`ros2 topic echo /map --once`）；查 `/received_global_plan` |
+| APPROACH 一直等，車不動 | TF 未就緒、bearing 不變、或 Unity 未 Play | 確認 Unity Play；`ros2 topic echo /car_C_rear_wheel --once` 應看到 ±450 等級（不是 ±10）；`tf2_echo map base_footprint` 看 pose 是否更新 |
+| 只看到 params 就停住 | 用了 control 選單而非 `bridge_nav.launch.py` | 改用 `ros2 launch car_control_pkg bridge_nav.launch.py` + Terminal 3 送 action |
 | 旋轉方向反了 | `bridge_heading_deg` 算錯（可能差 180°） | 確認目前 yaw：`ros2 run tf2_ros tf2_echo map base_footprint` |
+| 卡在坡道、卻顯示過橋完成 | SLAM 在橋上漂移，純計時過橋太早結束 | 看 log `CROSS_UP: odom=X/Y m`；調大 `cross_up_dist_m`；確認 odom TF 存在 |
+| 還沒到橋腳就進 ALIGN | SLAM 誤判距離 | 調大 `foot_reached_hold_sec`；確認曾 `max approach dist > foot_min_approach_dist_m` |
 | 到達橋頭後不停止 | `foot_reached_thresh_m` 太小，或地圖 offset 大 | 調大 `foot_reached_thresh_m`（0.4~0.5） |
-| 爬坡爬不上去 | 速度或時間不夠 | `cross_up_action: "FORWARD"` + 調長 `cross_up_sec` |
-| 過橋後 SLAM 位置跑掉 | 橋上 LiDAR 掃不到地圖特徵（正常現象） | 落地後等幾秒讓 SLAM 重新收斂；或在 Foxglove 確認 `/map` 持續更新 |
+| 爬坡爬不上去 | 速度或距離不夠 | `cross_up_action: "FORWARD"` + 調大 `cross_up_dist_m` |
+| 過橋後 SLAM 位置跑掉 | 橋上 LiDAR 掃不到地圖特徵（正常現象） | 落地後等幾秒讓 SLAM 重新收斂；過橋段靠 odom 不靠 map |
 | `Bridge_Nav` mode 不存在 | 沒有重新 `colcon build` | Terminal 2 容器內執行 `r` |
 | `TF lookup map→base_footprint failed` | SLAM 尚未發布 TF（剛啟動） | 等幾秒後重試；確認 `ros2 run tf2_ros tf2_echo map base_footprint` 有輸出 |
 
@@ -248,7 +272,7 @@ Bridge_Nav: bridge traversed
 | 檔案 | 說明 |
 |------|------|
 | `src/car_control_pkg/car_control_pkg/car_nav_controller.py` | `bridge_nav()` 狀態機（APPROACH / ALIGN / CROSS / DONE） |
-| `src/car_control_pkg/car_control_pkg/car_control_common.py` | TF2 pose 讀取 / `publish_goal_pose()` / bridge 參數宣告 |
+| `src/car_control_pkg/car_control_pkg/car_control_common.py` | TF2 pose 讀取 / `publish_goal_pose()` / 訂閱 `/received_global_plan` |
 | `src/car_control_pkg/car_control_pkg/car_action_server.py` | `Bridge_Nav` mode 串接 |
 | `src/car_control_pkg/launch/bridge_params.yaml` | **← 你需要修改這個** |
 | `src/car_control_pkg/launch/bridge_nav.launch.py` | 啟動腳本 |
