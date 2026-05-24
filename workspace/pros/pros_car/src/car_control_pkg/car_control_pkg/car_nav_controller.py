@@ -1,6 +1,7 @@
 from car_control_pkg.nav2_utils import (
     cal_distance,
     calculate_diff_angle,
+    get_yaw_from_quaternion,
 )
 from action_interface.action import NavGoal
 import time
@@ -46,6 +47,137 @@ class NavigationController:
 
     def reset_index(self):
         self.index = 0
+
+    # ------------------------------------------------------------------
+    # Bridge navigation (Bridge_Nav mode)
+    # ------------------------------------------------------------------
+    def reset_bridge(self):
+        """Initialise state for a fresh Bridge_Nav run."""
+        self.index = 0
+        self.bridge_phase = "APPROACH"
+        self.bridge_goal_published = False
+        self.bridge_seg_start = None
+        self.bridge_params = self.car_control_node.get_bridge_params()
+        self.car_control_node.get_logger().info(
+            f"Bridge_Nav reset; params={self.bridge_params}"
+        )
+
+    @staticmethod
+    def _normalize_deg(angle):
+        """Normalise an angle in degrees to [-180, 180)."""
+        return (angle + 180.0) % 360.0 - 180.0
+
+    def bridge_nav(self):
+        """
+        One tick of the bridge-crossing state machine. Returns None while the
+        mission is ongoing and a NavGoal.Result when finished.
+
+        Phases: APPROACH (Nav2 -> foot) -> ALIGN (rotate to bridge heading)
+        -> CROSS_UP / CROSS_PLATFORM / CROSS_DOWN (open-loop timed) -> DONE.
+        """
+        if not hasattr(self, "bridge_phase"):
+            self.reset_bridge()
+
+        p = self.bridge_params
+        node = self.car_control_node
+
+        if self.bridge_phase == "APPROACH":
+            # Publish the foot goal once so Nav2 plans a path to it.
+            if not self.bridge_goal_published:
+                node.publish_goal_pose(p["foot_x"], p["foot_y"], p["foot_yaw"])
+                self.bridge_goal_published = True
+                return None
+
+            car_position, car_orientation = node.get_car_position_and_orientation()
+            if car_position is None:
+                return None
+
+            dist = cal_distance(
+                [car_position.x, car_position.y], [p["foot_x"], p["foot_y"]]
+            )
+            if dist < p["foot_thresh"]:
+                node.publish_control("STOP")
+                self.bridge_phase = "ALIGN"
+                node.get_logger().info(
+                    f"Bridge_Nav: reached foot (dist={dist:.2f} m); aligning"
+                )
+                return None
+
+            # Follow the Nav2 global plan toward the foot.
+            path_points = node.get_path_points()
+            if not path_points:
+                return None
+            target_points, _ = self.get_next_target_point(
+                [car_position.x, car_position.y], path_points
+            )
+            if target_points is None:
+                return None
+            diff_angle = calculate_diff_angle(
+                [car_position.x, car_position.y],
+                [car_orientation.z, car_orientation.w],
+                target_points,
+            )
+            node.publish_control(self.choose_action(diff_angle))
+            return None
+
+        if self.bridge_phase == "ALIGN":
+            _, car_orientation = node.get_car_position_and_orientation()
+            if car_orientation is None:
+                return None
+            current_yaw = get_yaw_from_quaternion(
+                car_orientation.z, car_orientation.w
+            )
+            diff = self._normalize_deg(p["heading_deg"] - current_yaw)
+            if abs(diff) < p["align_tol"]:
+                node.publish_control("STOP")
+                self.bridge_phase = "CROSS_UP"
+                self.bridge_seg_start = time.time()
+                node.get_logger().info("Bridge_Nav: aligned; starting climb")
+                return None
+            if diff > 0:
+                action = (
+                    "COUNTERCLOCKWISE_ROTATION_MEDIAN"
+                    if abs(diff) < 30
+                    else "COUNTERCLOCKWISE_ROTATION"
+                )
+            else:
+                action = (
+                    "CLOCKWISE_ROTATION_MEDIAN"
+                    if abs(diff) < 30
+                    else "CLOCKWISE_ROTATION"
+                )
+            node.publish_control(action)
+            return None
+
+        if self.bridge_phase in ("CROSS_UP", "CROSS_PLATFORM", "CROSS_DOWN"):
+            # (action, duration, next_phase) per timed segment.
+            segments = {
+                "CROSS_UP": (p["up_action"], p["up_sec"], "CROSS_PLATFORM"),
+                "CROSS_PLATFORM": (
+                    p["platform_action"],
+                    p["platform_sec"],
+                    "CROSS_DOWN",
+                ),
+                "CROSS_DOWN": (p["down_action"], p["down_sec"], "DONE"),
+            }
+            action, duration, next_phase = segments[self.bridge_phase]
+            node.publish_control(action)
+            if time.time() - self.bridge_seg_start >= duration:
+                node.get_logger().info(
+                    f"Bridge_Nav: {self.bridge_phase} done -> {next_phase}"
+                )
+                self.bridge_phase = next_phase
+                self.bridge_seg_start = time.time()
+            return None
+
+        # DONE
+        for _ in range(5):
+            node.publish_control("STOP")
+            time.sleep(0.05)
+        node.clear_plan()
+        node.clear_goal_pose()
+        node.get_logger().info("Bridge_Nav: bridge traversed")
+        return NavGoal.Result(success=True, message="bridge traversed")
 
     def customize_nav(self):
         result = self.check_prerequisites()

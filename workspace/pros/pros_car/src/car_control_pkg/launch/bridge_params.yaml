@@ -1,0 +1,21 @@
+# Parameters for the Bridge_Nav mode. Read off the Foxglove map (see plan).
+# All numeric values MUST be floats (keep the trailing .0).
+car_control_node:
+  ros__parameters:
+    # Point A (foot/start): flat ground just before the up-ramp, bridge centerline.
+    bridge_foot_x: 0.8800882630631284 
+    bridge_foot_y: 0.7234833457072615
+    bridge_foot_yaw: 86.74        # deg; set equal to bridge_heading_deg
+    # Direction the bridge runs: atan2(B.y - A.y, B.x - A.x) in degrees.
+    bridge_heading_deg: 86.74
+    # Arrival / alignment tolerances.
+    foot_reached_thresh_m: 0.3
+    align_tol_deg: 8.0
+    # Open-loop timed crossing (seconds per segment) - measure/tune on the bridge.
+    cross_up_sec: 3.0
+    cross_platform_sec: 2.0
+    cross_down_sec: 3.0
+    # Speed action per segment (keys from action_config.ACTION_MAPPINGS).
+    cross_up_action: "FORWARD"
+    cross_platform_action: "FORWARD_SLOW"
+    cross_down_action: "FORWARD_SLOW"

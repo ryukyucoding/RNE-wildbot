@@ -1,10 +1,12 @@
 import rclpy
+import tf2_ros
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, String
-from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path
 from car_control_pkg.utils import get_action_mapping, parse_control_signal
 import copy
+import math
 from car_control_pkg.nav2_utils import cal_distance
 import json
 
@@ -81,17 +83,70 @@ class BaseCarControlNode(Node):
         )
 
         # Navigation data storage
-        self.latest_amcl_pose = None
         self.latest_goal_pose = None
         self.latest_global_plan = None
         self.latest_camera_depth = None
         self.latest_yolo_info = None
         self.latest_cmd_vel = None
 
+        # TF2: provides map→base_footprint from slam_toolbox or AMCL
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
         # Create navigation data subscribers if enabled
         if enable_nav_subscribers:
             self._create_navigation_subscribers()
-            
+            self._declare_bridge_parameters()
+
+    def _declare_bridge_parameters(self):
+        """Declare parameters used by the Bridge_Nav mode (set via params file)."""
+        self.declare_parameter("bridge_foot_x", 0.0)
+        self.declare_parameter("bridge_foot_y", 0.0)
+        self.declare_parameter("bridge_foot_yaw", 0.0)      # degrees
+        self.declare_parameter("bridge_heading_deg", 0.0)   # degrees
+        self.declare_parameter("foot_reached_thresh_m", 0.3)
+        self.declare_parameter("align_tol_deg", 8.0)
+        self.declare_parameter("cross_up_sec", 3.0)
+        self.declare_parameter("cross_platform_sec", 2.0)
+        self.declare_parameter("cross_down_sec", 3.0)
+        self.declare_parameter("cross_up_action", "FORWARD")
+        self.declare_parameter("cross_platform_action", "FORWARD_SLOW")
+        self.declare_parameter("cross_down_action", "FORWARD_SLOW")
+
+    def get_bridge_params(self):
+        """Return the Bridge_Nav parameters as a plain dict."""
+        return {
+            "foot_x": float(self.get_parameter("bridge_foot_x").value),
+            "foot_y": float(self.get_parameter("bridge_foot_y").value),
+            "foot_yaw": float(self.get_parameter("bridge_foot_yaw").value),
+            "heading_deg": float(self.get_parameter("bridge_heading_deg").value),
+            "foot_thresh": float(self.get_parameter("foot_reached_thresh_m").value),
+            "align_tol": float(self.get_parameter("align_tol_deg").value),
+            "up_sec": float(self.get_parameter("cross_up_sec").value),
+            "platform_sec": float(self.get_parameter("cross_platform_sec").value),
+            "down_sec": float(self.get_parameter("cross_down_sec").value),
+            "up_action": str(self.get_parameter("cross_up_action").value),
+            "platform_action": str(self.get_parameter("cross_platform_action").value),
+            "down_action": str(self.get_parameter("cross_down_action").value),
+        }
+
+    def publish_goal_pose(self, x, y, yaw_deg=0.0):
+        """Publish a navigation goal (PoseStamped, frame 'map') to /goal_pose for Nav2."""
+        goal = PoseStamped()
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.header.frame_id = "map"
+        goal.pose.position.x = float(x)
+        goal.pose.position.y = float(y)
+        goal.pose.position.z = 0.0
+        yaw = math.radians(yaw_deg)
+        goal.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.orientation.w = math.cos(yaw / 2.0)
+        self.goal_clear_pub.publish(goal)
+        self.latest_goal_pose = goal
+        self.get_logger().info(
+            f"Published bridge foot goal to /goal_pose: ({x:.2f}, {y:.2f}, yaw={yaw_deg:.1f} deg)"
+        )
+
     def clear_goal_pose(self):
         """
         Clear the /goal_pose topic by publishing an empty PoseStamped message
@@ -127,16 +182,12 @@ class BaseCarControlNode(Node):
 
     def _create_navigation_subscribers(self):
         """Create all subscribers needed for navigation"""
-        self.amcl_sub = self.create_subscription(
-            PoseWithCovarianceStamped, "/amcl_pose", self._amcl_callback, 10
-        )
-
         self.goal_pose_sub = self.create_subscription(
             PoseStamped, "/goal_pose", self._goal_pose_callback, 10
         )
 
         self.plan_sub = self.create_subscription(
-            Path, "/received_global_plan", self._global_plan_callback, 1
+            Path, "/plan", self._global_plan_callback, 1
         )
 
         self.cmd_vel_sub = self.create_subscription(
@@ -157,10 +208,6 @@ class BaseCarControlNode(Node):
         self.get_logger().info("Navigation subscribers created")
 
     # Callback methods for navigation data
-    def _amcl_callback(self, msg):
-        """Store latest AMCL pose"""
-        self.latest_amcl_pose = msg
-
     def _goal_pose_callback(self, msg):
         """Store latest AMCL pose"""
         self.latest_goal_pose = msg
@@ -243,16 +290,24 @@ class BaseCarControlNode(Node):
     # Helper methods for navigation data access
     def get_car_position_and_orientation(self):
         """
-        Get current car position and orientation
+        Get current car position and orientation via TF2 lookup (map → base_footprint).
+        Works with both slam_toolbox and AMCL as the TF provider.
 
         Returns:
-            Tuple containing (position, orientation) or (None, None) if data unavailable
+            Tuple (position, orientation) where position has .x .y .z
+            and orientation has .x .y .z .w, or (None, None) on failure.
         """
-        if self.latest_amcl_pose:
-            position = self.latest_amcl_pose.pose.pose.position
-            orientation = self.latest_amcl_pose.pose.pose.orientation
-            return position, orientation
-        return None, None
+        try:
+            t = self.tf_buffer.lookup_transform(
+                "map", "base_footprint", rclpy.time.Time()
+            )
+            return t.transform.translation, t.transform.rotation
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup map→base_footprint failed: {e}",
+                throttle_duration_sec=1.0,
+            )
+            return None, None
 
     def cmd_vel_callback(self, msg: Twist):
         wheel_distance = 0.5

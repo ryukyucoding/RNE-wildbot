@@ -47,6 +47,8 @@ class NavigationActionServer(Node):
         print("mode : ", mode)
         rate = self.create_rate(10)
         self.nav_controller.reset_index()
+        if mode == "Bridge_Nav":
+            self.nav_controller.reset_bridge()
         while rclpy.ok():
             # First give executor time to process callbacks
             rate.sleep()
@@ -87,5 +89,7 @@ class NavigationActionServer(Node):
             return self.nav_controller.manual_nav
         elif mode == "Customize_Nav":
             return self.nav_controller.customize_nav
+        elif mode == "Bridge_Nav":
+            return self.nav_controller.bridge_nav
         else:
             self.get_logger().error(f"Unknown mode requested: {mode}")  # Log error here
