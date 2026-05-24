@@ -104,7 +104,10 @@ class Nav2Processing:
                 self.recordFlag = 1
                 action_key = "STOP"
 
-        car_position, car_orientation = self.data_processor.get_processed_amcl_pose()
+        amcl_result = self.data_processor.get_processed_amcl_pose()
+        if amcl_result is None:
+            return "STOP"
+        car_position, car_orientation = amcl_result
 
         goal_position = self.ros_communicator.get_latest_goal()
         target_distance = cal_distance(car_position, goal_position)
@@ -121,20 +124,28 @@ class Nav2Processing:
         diff_angle = self.calculate_diff_angle(
             car_position, car_orientation, target_x, target_y
         )
-        if diff_angle < 20 and diff_angle > -20:
+        if -20 < diff_angle < 20:
             action_key = "FORWARD"
-        elif diff_angle < -20 and diff_angle > -180:
+        elif -180 <= diff_angle <= -20:
             action_key = "CLOCKWISE_ROTATION"
-        elif diff_angle > 20 and diff_angle < 180:
+        else:
             action_key = "COUNTERCLOCKWISE_ROTATION"
         return action_key
 
     def check_data_availability(self):
-        return (
-            self.data_processor.get_processed_received_global_plan_no_dynamic()
-            and self.data_processor.get_processed_amcl_pose()
-            and self.ros_communicator.get_latest_goal()
-        )
+        plan = self.data_processor.get_processed_received_global_plan_no_dynamic()
+        if not plan:
+            print("[check_data] STOP — no valid global plan yet")
+            return False
+        amcl = self.data_processor.get_processed_amcl_pose()
+        if not amcl:
+            print("[check_data] STOP — AMCL pose not available yet")
+            return False
+        goal = self.ros_communicator.get_latest_goal()
+        if not goal:
+            print("[check_data] STOP — goal pose not set yet")
+            return False
+        return True
 
     def get_next_target_point(self, car_position, min_required_distance=0.5):
         """
@@ -170,54 +181,55 @@ class Nav2Processing:
 
     def camera_nav(self):
         """
-        YOLO 目標資訊 (yolo_target_info) 說明：
+        YOLO-based navigation with optional depth-camera obstacle avoidance.
+        Works with YOLO alone; depth camera improves obstacle handling when available.
 
-        - 索引 0 (index 0)：
-            - 表示是否成功偵測到目標
-            - 0：未偵測到目標
-            - 1：成功偵測到目標
+        yolo_target_info[0]: 1=detected, 0=not detected
+        yolo_target_info[1]: depth in metres (0=no target, -1=too close)
+        yolo_target_info[2]: pixel offset from centre (+ve=right, -ve=left)
 
-        - 索引 1 (index 1)：
-            - 目標的深度距離 (與相機的距離，單位為公尺)，如果沒偵測到目標就回傳 0
-            - 與目標過近時(大約 40 公分以內)會回傳 -1
-
-        - 索引 2 (index 2)：
-            - 目標相對於畫面正中心的像素偏移量
-            - 若目標位於畫面中心右側，數值為正
-            - 若目標位於畫面中心左側，數值為負
-            - 若沒有目標則回傳 0
-
-        畫面 n 個等分點深度 (camera_multi_depth) 說明 :
-
-        - 儲存相機畫面中央高度上 n 個等距水平點的深度值。
-        - 若距離過遠、過近（小於 40 公分）或是實體相機有時候深度會出一些問題，則該點的深度值將設定為 -1。
+        camera_multi_depth: 20 evenly-spaced depth points across the frame
+          [0:7]   = left sector
+          [7:13]  = forward sector
+          [13:20] = right sector
+          -1 means invalid / too close
         """
         yolo_target_info = self.data_processor.get_yolo_target_info()
-        camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
-        if camera_multi_depth == None or yolo_target_info == None:
+        # YOLO is required; depth camera is optional
+        if yolo_target_info is None:
             return "STOP"
 
-        camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:13])
-        camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
-        camera_right_depth = self.filter_negative_one(camera_multi_depth[13:20])
+        camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
+        limit_distance = 0.7  # metres — obstacle threshold for real robot
 
-        action = "STOP"
-        limit_distance = 0.7
+        # ── Depth-based obstacle avoidance (skipped if sensor unavailable) ──
+        if camera_multi_depth is not None:
+            camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:13])
+            camera_left_depth    = self.filter_negative_one(camera_multi_depth[0:7])
+            camera_right_depth   = self.filter_negative_one(camera_multi_depth[13:20])
 
-        # if all(depth > limit_distance for depth in camera_forward_depth):
+            if camera_forward_depth and not all(d > limit_distance for d in camera_forward_depth):
+                # Forward path is blocked — dodge to the open side
+                left_clear  = not camera_left_depth  or all(d > limit_distance for d in camera_left_depth)
+                right_clear = not camera_right_depth or all(d > limit_distance for d in camera_right_depth)
+                if left_clear:
+                    return "COUNTERCLOCKWISE_ROTATION"
+                if right_clear:
+                    return "CLOCKWISE_ROTATION"
+                return "BACKWARD_SLOW"
+
+        # ── YOLO target following ──
         if yolo_target_info[0] == 1:
             if yolo_target_info[2] > 200.0:
-                action = "CLOCKWISE_ROTATION"
+                return "CLOCKWISE_ROTATION"
             elif yolo_target_info[2] < -200.0:
-                action = "COUNTERCLOCKWISE_ROTATION"
+                return "COUNTERCLOCKWISE_ROTATION"
             else:
                 if yolo_target_info[1] < 0.5:
-                    action = "STOP"
-                else:
-                    action = "FORWARD_SLOW"
+                    return "STOP"
+                return "FORWARD_SLOW"
         else:
-            action = "CLOCKWISE_ROTATION"
-        return action
+            return "CLOCKWISE_ROTATION"  # spin to search for target
 
     def apply_obstacle_guard_action(
         self,
@@ -443,62 +455,42 @@ class Nav2Processing:
 
     def camera_nav_unity(self):
         """
-        YOLO 目標資訊 (yolo_target_info) 說明：
+        Unity-sim variant of camera_nav.
+        Uses larger depth thresholds (10m) because Unity depth values are unscaled.
 
-        - 索引 0 (index 0)：
-            - 表示是否成功偵測到目標
-            - 0：未偵測到目標
-            - 1：成功偵測到目標
-
-        - 索引 1 (index 1)：
-            - 目標的深度距離 (與相機的距離，單位為公尺)，如果沒偵測到目標就回傳 0
-            - 與目標過近時(大約 40 公分以內)會回傳 -1
-
-        - 索引 2 (index 2)：
-            - 目標相對於畫面正中心的像素偏移量
-            - 若目標位於畫面中心右側，數值為正
-            - 若目標位於畫面中心左側，數值為負
-            - 若沒有目標則回傳 0
-
-        畫面 n 個等分點深度 (camera_multi_depth) 說明 :
-
-        - 儲存相機畫面中央高度上 n 個等距水平點的深度值。
-        - 若距離過遠、過近（小於 40 公分）或是實體相機有時候深度會出一些問題，則該點的深度值將設定為 -1。
+        yolo_target_info[0]: 1=detected, 0=not detected
+        yolo_target_info[1]: depth in Unity units
+        yolo_target_info[2]: pixel offset from centre (+ve=right, -ve=left)
         """
+        # ── Guard: fetch data first, check before any access ──
         yolo_target_info = self.data_processor.get_yolo_target_info()
         camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
-        yolo_target_info[1] *= 1
-        camera_multi_depth = list(
-            map(lambda x: x * 1.0, self.data_processor.get_camera_x_multi_depth())
-        )
 
-        if camera_multi_depth == None or yolo_target_info == None:
+        if yolo_target_info is None or camera_multi_depth is None:
             return "STOP"
 
         camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:13])
-        camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
-        camera_right_depth = self.filter_negative_one(camera_multi_depth[13:20])
-        action = "STOP"
-        limit_distance = 10.0
-        print(yolo_target_info[1])
+        camera_left_depth    = self.filter_negative_one(camera_multi_depth[0:7])
+        camera_right_depth   = self.filter_negative_one(camera_multi_depth[13:20])
+        limit_distance = 10.0  # Unity depth scale
+
         if all(depth > limit_distance for depth in camera_forward_depth):
             if yolo_target_info[0] == 1:
                 if yolo_target_info[2] > 200.0:
-                    action = "CLOCKWISE_ROTATION"
+                    return "CLOCKWISE_ROTATION"
                 elif yolo_target_info[2] < -200.0:
-                    action = "COUNTERCLOCKWISE_ROTATION"
+                    return "COUNTERCLOCKWISE_ROTATION"
                 else:
                     if yolo_target_info[1] < 2.0:
-                        action = "STOP"
-                    else:
-                        action = "FORWARD_SLOW"
+                        return "STOP"
+                    return "FORWARD_SLOW"
             else:
-                action = "FORWARD"
+                return "FORWARD"
         elif any(depth < limit_distance for depth in camera_left_depth):
-            action = "CLOCKWISE_ROTATION"
+            return "CLOCKWISE_ROTATION"
         elif any(depth < limit_distance for depth in camera_right_depth):
-            action = "COUNTERCLOCKWISE_ROTATION"
-        return action
+            return "COUNTERCLOCKWISE_ROTATION"
+        return "STOP"
 
     def stop_nav(self):
         return "STOP"
