@@ -5,4 +5,5 @@ main \
     "$COMPOSE_DIR/docker-compose_foxglove_bridge.yml" \
     "$COMPOSE_DIR/docker-compose_camera_gemini.yml" \
     "$COMPOSE_DIR/docker-compose_lidar_pkg.yml" \
-    "$COMPOSE_DIR/docker-compose_oradarlidar.yml"
+    "$COMPOSE_DIR/docker-compose_oradarlidar.yml" \
+    "$COMPOSE_DIR/docker-compose_static_tf.yml"

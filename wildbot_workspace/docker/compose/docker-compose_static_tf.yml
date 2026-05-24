@@ -1,0 +1,16 @@
+services:
+  static_tf:
+    image: wildbot_workspace
+    env_file:
+      - .env
+    networks:
+      - my_bridge_network
+    command: >
+      ros2 run tf2_ros static_transform_publisher
+      --x 0.105 --y 0.0 --z 0.255
+      --roll 0 --pitch 0 --yaw 0
+      --frame-id base_link --child-frame-id camera_link
+
+networks:
+  my_bridge_network:
+    driver: bridge

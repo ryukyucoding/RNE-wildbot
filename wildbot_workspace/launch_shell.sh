@@ -23,7 +23,7 @@ elif [ "$CURRENT_HASH" != "$(cat $MARKER)" ]; then
 fi
 
 if [ "$NEED_BUILD" = true ]; then
-  docker build -t $IMAGE_NAME . || { echo "[wildbot] Build 失敗"; exit 1; }
+  docker build --network=host -t $IMAGE_NAME . || { echo "[wildbot] Build 失敗"; exit 1; }
   echo $CURRENT_HASH > $MARKER
   echo "[wildbot] Build 完成"
 fi

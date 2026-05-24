@@ -93,12 +93,14 @@ tailscale up --advertise-exit-node --accept-routes
 
 **PN54 上（需要外網時執行）：**
 ```bash
-sudo tailscale up --exit-node=100.103.10.56 --accept-routes
+sudo tailscale up --accept-routes --exit-node=100.103.10.56 --advertise-exit-node=false
+
 ```
 
 **用完關掉（避免影響 PN54 正常路由）：**
 ```bash
-sudo tailscale up --exit-node= --accept-routes
+sudo tailscale up --accept-routes --exit-node= --advertise-exit-node=true
+
 ```
 
 > ⚠️ **重要：exit node 開著會讓 Foxglove（ws://100.107.41.55:8765）斷線。**

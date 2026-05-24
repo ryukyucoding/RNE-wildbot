@@ -5,9 +5,16 @@
 ## 🐳 Docker 建置
 
 ```bash
+
+cd wildbot_workspace
+./launch_shell.sh
+
+
 # 建置 wildbot 主容器（在 wildbot_workspace/ 目錄下）
 cd wildbot_workspace
 docker build --no-cache --network=host -t wildbot_workspace .
+
+
 
 # 建置 YOLO 容器（在 ros2_yolo_integration/ 目錄下）
 cd workspace/pros/ros2_yolo_integration
@@ -23,7 +30,7 @@ docker build --no-cache --network=host -t ros2_yolo_integration .
 cd wildbot_workspace
 ./scripts/00_start_all.sh
 
-# 進入 wildbot 容器
+# 進入 wildbot 容器 (可以多開一個./launch_shell.sh 打指令的地方)
 docker exec -it wildbot bash
 ```
 
@@ -43,16 +50,15 @@ colcon build --symlink-install && source install/setup.bash
 
 ---
 
-## 🤖 YOLO 啟動（YOLO 容器內）
+## 🤖 YOLO 啟動
 
 ```bash
-# 進入 YOLO 容器
-docker exec -it <yolo_container_name> bash
+# 主機上：啟動 YOLO 容器（x86_64，自動嘗試 GPU → 失敗則 CPU）
+cd ~/RNE/workspace/pros/ros2_yolo_integration
+./yolo_activate.sh
 
-# Build YOLO 套件
+# 容器內：Build 並啟動 YOLO 節點
 cd /workspaces && colcon build --symlink-install && source install/setup.bash
-
-# 啟動 YOLO 節點
 ros2 run yolo_example_pkg yolo_node --ros-args \
   --remap /camera/image/compressed:=/camera/color/image_raw/compressed \
   -p camera_optical_frame:=camera_color_optical_frame
@@ -79,20 +85,31 @@ ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/Joint
 ## 🐻 去抓熊任務
 
 ```bash
+cd /workspaces
+colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
+
 ros2 run pros_car_py bear_mission --ros-args \
-  -p use_unity_camera_nav:=false \
   -p amcl_wait_timeout_sec:=3.0 \
-  -p grasp_trigger_dist_m:=0.5 \
-  -p visual_servo_target_depth_m:=0.45 \
+  -p grasp_trigger_dist_m:=0.50 \
   -p approach_stop_dist_m:=0.40 \
+  -p visual_servo_target_depth_m:=0.45 \
   -p visual_servo_yaw_deadband_px:=100.0 \
+  -p visual_servo_yaw_soft_scale_px:=350.0 \
   -p visual_servo_max_yaw_near:=8.0 \
   -p visual_servo_max_yaw_far:=15.0 \
-  -p visual_servo_yaw_soft_scale_px:=350.0 \
   -p visual_servo_search_spin_speed:=8.0 \
   -p align_pixel_thresh:=100.0 \
   -p grasp_bbox_px:=200.0 \
-  -p grasp_confirm_frames:=4
+  -p grasp_confirm_frames:=4 \
+  -p visual_servo_dx_ema_alpha:=0.15 \
+  -p visual_servo_depth_ema_alpha:=0.20 \
+  -p approach_max_speed_mps:=0.80 \
+  -p visual_servo_max_forward_speed_far:=500.0 \
+  -p obstacle_source_debug_enabled:=true \
+  -p approach_yolo_lost_grace_sec:=1.5 \
+  -p approach_yolo_search_spin_speed_tier:=slow \
+  -p approach_yolo_explore_forward_sec:=2.0
+
 ```
 
 ---
@@ -122,6 +139,18 @@ ros2 topic pub --once /base_controller/cmd_vel geometry_msgs/msg/TwistStamped \
   "{header: {frame_id: 'base_link'}, twist: {linear: {x: 0.1}, angular: {z: 0.0}}}"
 ```
 
+## 夾爪失敗
+# 在 wildbot 容器內執行（背景跑）
+ros2 run tf2_ros static_transform_publisher \
+  --x 0.105 --y 0.0 --z 0.255 \
+  --roll 0 --pitch 0 --yaw 0 \
+  --frame-id base_link --child-frame-id camera_link &
+
+驗證 TF 有沒有通
+ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame
+
+
+
 ---
 
 ## 📡 Foxglove 常用 Topics
@@ -133,3 +162,32 @@ ros2 topic pub --once /base_controller/cmd_vel geometry_msgs/msg/TwistStamped \
 | odom 位置 | `/base_controller/odom` |
 | 相機影像 | `/camera/color/image_raw/compressed` |
 | 手臂關節狀態 | `/joint_states` |
+
+
+
+
+# 進入 wildbot 容器
+docker exec -it wildbot bash
+
+# 容器內：build
+cd /workspaces
+colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
+
+# 跑 bear mission
+ros2 run pros_car_py bear_mission --ros-args \
+  -p amcl_wait_timeout_sec:=3.0 \
+  -p grasp_trigger_dist_m:=0.65 \
+  -p approach_stop_dist_m:=0.45 \
+  -p visual_servo_target_depth_m:=0.45 \
+  -p visual_servo_yaw_deadband_px:=30.0 \
+  -p visual_servo_yaw_soft_scale_px:=200.0 \
+  -p visual_servo_max_yaw_near:=80.0 \
+  -p visual_servo_max_yaw_far:=140.0 \
+  -p visual_servo_search_spin_speed:=60.0 \
+  -p align_pixel_thresh:=60.0 \
+  -p grasp_bbox_px:=200.0 \
+  -p grasp_confirm_frames:=4 \
+  -p obstacle_source_debug_enabled:=true \
+  -p approach_yolo_lost_grace_sec:=1.5 \
+  -p approach_yolo_search_spin_speed_tier:=slow \
+  -p approach_yolo_explore_forward_sec:=2.0
