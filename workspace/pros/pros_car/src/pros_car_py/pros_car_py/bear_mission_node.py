@@ -33,7 +33,7 @@ from std_srvs.srv import Trigger
 from pros_car_py.arm_controller_2D import ArmController
 from pros_car_py.data_processor import DataProcessor
 from pros_car_py.nav_processing import Nav2Processing
-from pros_car_py.obstacle_guard import ObstacleGuard, get_lidar_sector_minimums, _finite_clearance
+from pros_car_py.obstacle_guard import ObstacleGuard, get_lidar_sector_minimums, get_lidar_rear_minimum, _finite_clearance
 from pros_car_py.ros_communicator import RosCommunicator
 
 
@@ -80,6 +80,13 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("approach_stuck_forward_sec", 0.35)
         self.declare_parameter("motion_stuck_min_progress_m", 0.06)
         self.declare_parameter("visual_servo_lost_timeout_sec", 0.8)
+        self.declare_parameter("approach_yolo_lost_grace_sec", 1.5)
+        self.declare_parameter("approach_yolo_lost_min_frames", 12)
+        self.declare_parameter("approach_yolo_search_spin_speed_tier", "slow")
+        self.declare_parameter("approach_yolo_lost_search_circle_rad", 6.283185307)
+        self.declare_parameter("approach_yolo_explore_forward_sec", 2.0)
+        self.declare_parameter("approach_yolo_explore_forward_speed", 180.0)
+        self.declare_parameter("approach_yolo_lost_motion_log_sec", 2.0)
         self.declare_parameter("align_pixel_thresh", 40.0)
         self.declare_parameter("align_pixel_bias_px", 0.0)
         self.declare_parameter("align_stable_frames", 5)
@@ -116,6 +123,8 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("fallback_rotate_step_sec", 0.18)
         self.declare_parameter("fallback_forward_step_sec", 0.20)
         self.declare_parameter("drop_at_home", True)
+        # True：先回到 home 位置 → 放下娃娃 → 再轉回任務開始時的面向
+        self.declare_parameter("drop_before_final_heading", True)
         self.declare_parameter("auto_start", True)
         self.declare_parameter("auto_start_delay_sec", 5.0)
         self.declare_parameter("amcl_wait_timeout_sec", 120.0)
@@ -128,6 +137,10 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("nav_obstacle_guard_enabled", True)
         self.declare_parameter("nav_obstacle_stop_m", -1.0)
         self.declare_parameter("obstacle_log_interval_sec", 1.0)
+        self.declare_parameter("obstacle_source_debug_enabled", True)
+        self.declare_parameter("obstacle_scale_floor_far", 0.60)
+        self.declare_parameter("obstacle_scale_floor_mid", 0.30)
+        self.declare_parameter("obstacle_scale_floor_slow", 0.20)
 
         self._mission_busy = threading.Lock()
         self._running = False
@@ -223,12 +236,46 @@ class BearMissionHost(RosCommunicator):
             guard.lidar_max_m = lidar_max
         return guard
 
+    @staticmethod
+    def _approach_zone_name(dist_m: float, zone_far: float, zone_mid: float) -> str:
+        if dist_m > zone_far:
+            return "far"
+        if dist_m > zone_mid:
+            return "mid"
+        return "slow"
+
+    def _obstacle_speed_scale_floor(
+        self,
+        dist_m: float,
+        zone_far: float,
+        zone_mid: float,
+    ) -> float:
+        zone = self._approach_zone_name(dist_m, zone_far, zone_mid)
+        if zone == "far":
+            return (
+                self.get_parameter("obstacle_scale_floor_far")
+                .get_parameter_value()
+                .double_value
+            )
+        if zone == "mid":
+            return (
+                self.get_parameter("obstacle_scale_floor_mid")
+                .get_parameter_value()
+                .double_value
+            )
+        return (
+            self.get_parameter("obstacle_scale_floor_slow")
+            .get_parameter_value()
+            .double_value
+        )
+
     def _evaluate_obstacles(
         self,
         dp: DataProcessor,
         guard: ObstacleGuard,
         approach_target_depth_m: float | None = None,
         approach_mode: bool = False,
+        speed_scale_floor: float | None = None,
     ):
         return guard.evaluate(
             lidar_sectors=get_lidar_sector_minimums(dp),
@@ -236,6 +283,8 @@ class BearMissionHost(RosCommunicator):
             sector_depth=dp.get_obstacle_sector_depth(),
             approach_target_depth_m=approach_target_depth_m,
             approach_mode=approach_mode,
+            speed_scale_floor=speed_scale_floor,
+            lidar_rear_m=get_lidar_rear_minimum(dp),
         )
 
     @staticmethod
@@ -245,7 +294,10 @@ class BearMissionHost(RosCommunicator):
 
     @staticmethod
     def _update_motion_progress(
-        state: dict, pose_msg, min_progress_m: float
+        state: dict,
+        pose_msg,
+        min_progress_m: float,
+        min_progress_yaw_rad: float | None = None,
     ) -> None:
         if pose_msg is None:
             return
@@ -256,12 +308,104 @@ class BearMissionHost(RosCommunicator):
             if math.hypot(x - last[0], y - last[1]) >= min_progress_m:
                 state["last_progress_time"] = time.monotonic()
         state["last_pose_xy"] = (x, y)
+        if min_progress_yaw_rad is not None:
+            yaw = BearMissionHost._yaw_from_quat(pose_msg.pose.pose.orientation)
+            last_yaw = state.get("last_pose_yaw")
+            if last_yaw is not None:
+                dyaw = abs(BearMissionHost._normalize_angle(yaw - last_yaw))
+                if dyaw >= min_progress_yaw_rad:
+                    state["last_progress_time"] = time.monotonic()
+            state["last_pose_yaw"] = yaw
+
+    @staticmethod
+    def _reset_yolo_search_state(state: dict) -> None:
+        state["phase"] = "idle"
+        state["accumulated_rad"] = 0.0
+        state["last_yaw"] = None
+        state["explore_until"] = 0.0
+        state["logged_spin"] = False
+
+    @staticmethod
+    def _target_live(yolo_target_info) -> bool:
+        if yolo_target_info is None or len(yolo_target_info) < 3:
+            return False
+        return (
+            float(yolo_target_info[0]) == 1.0
+            and float(yolo_target_info[1]) > 0.0
+        )
+
+    @staticmethod
+    def _spin_action_names(speed_tier: str) -> tuple[str, str]:
+        tier = (speed_tier or "slow").strip().lower()
+        if tier == "median":
+            return (
+                "COUNTERCLOCKWISE_ROTATION_MEDIAN",
+                "CLOCKWISE_ROTATION_MEDIAN",
+            )
+        if tier in ("fast", "full"):
+            return ("COUNTERCLOCKWISE_ROTATION", "CLOCKWISE_ROTATION")
+        return (
+            "COUNTERCLOCKWISE_ROTATION_SLOW",
+            "CLOCKWISE_ROTATION_SLOW",
+        )
+
+    @staticmethod
+    def _normalize_spin_action_tier(action: str, speed_tier: str) -> str:
+        ccw, cw = BearMissionHost._spin_action_names(speed_tier)
+        if action in (
+            "COUNTERCLOCKWISE_ROTATION",
+            "COUNTERCLOCKWISE_ROTATION_MEDIAN",
+            "COUNTERCLOCKWISE_ROTATION_SLOW",
+        ):
+            return ccw
+        if action in (
+            "CLOCKWISE_ROTATION",
+            "CLOCKWISE_ROTATION_MEDIAN",
+            "CLOCKWISE_ROTATION_SLOW",
+        ):
+            return cw
+        return action
+
+    @staticmethod
+    def _track_yolo_search_yaw(state: dict, pose_msg, max_step_rad: float = 0.28) -> float:
+        """Accumulate absolute yaw during confirmed yolo-lost search spin."""
+        if pose_msg is None:
+            return float(state.get("accumulated_rad", 0.0))
+        yaw = BearMissionHost._yaw_from_quat(pose_msg.pose.pose.orientation)
+        last_yaw = state.get("last_yaw")
+        if last_yaw is not None:
+            dyaw = abs(BearMissionHost._normalize_angle(yaw - last_yaw))
+            dyaw = min(dyaw, max(0.05, float(max_step_rad)))
+            state["accumulated_rad"] = float(state.get("accumulated_rad", 0.0)) + dyaw
+        state["last_yaw"] = yaw
+        return float(state.get("accumulated_rad", 0.0))
 
     @staticmethod
     def _motion_is_stuck(state: dict, stuck_time_sec: float) -> bool:
         return (
             time.monotonic() - state["last_progress_time"] > stuck_time_sec
         )
+
+    @staticmethod
+    def _yolo_search_action_key(
+        obs=None, dx_px: float | None = None, spin_tier: str = "slow"
+    ) -> str:
+        """Pick mapped spin action for yolo-lost search."""
+        ccw, cw = BearMissionHost._spin_action_names(spin_tier)
+        if dx_px is not None:
+            if dx_px < -20.0:
+                return ccw
+            if dx_px > 20.0:
+                return cw
+        if obs is not None:
+            left = obs.left_clearance_m
+            right = obs.right_clearance_m
+            if math.isfinite(left) and math.isfinite(right):
+                if right + 0.05 < left:
+                    return ccw
+                if left + 0.05 < right:
+                    return cw
+        return ccw
 
     @staticmethod
     def _yolo_search_wheel_cmd(
@@ -279,14 +423,49 @@ class BearMissionHost(RosCommunicator):
                 return cw
 
         if obs is not None:
-            left = _finite_clearance(obs.sensor_left_m, float("inf"))
-            right = _finite_clearance(obs.sensor_right_m, float("inf"))
+            left = obs.left_clearance_m
+            right = obs.right_clearance_m
             if math.isfinite(left) and math.isfinite(right):
                 if right + 0.05 < left:
                     return ccw
                 if left + 0.05 < right:
                     return cw
         return ccw
+
+    def _pick_yolo_lost_spin_action(
+        self,
+        guard: ObstacleGuard,
+        obs,
+        dx_px: float | None,
+        spin_tier: str = "slow",
+    ) -> str:
+        ccw, cw = self._spin_action_names(spin_tier)
+        action = self._yolo_search_action_key(
+            obs=obs, dx_px=dx_px, spin_tier=spin_tier
+        )
+        if obs.block_cmd in (
+            "CLOCKWISE_ROTATION",
+            "CLOCKWISE_ROTATION_MEDIAN",
+            "CLOCKWISE_ROTATION_SLOW",
+            "COUNTERCLOCKWISE_ROTATION",
+            "COUNTERCLOCKWISE_ROTATION_MEDIAN",
+            "COUNTERCLOCKWISE_ROTATION_SLOW",
+        ):
+            action = self._normalize_spin_action_tier(obs.block_cmd, spin_tier)
+        elif obs.block_cmd == "STOP" and obs.speed_scale <= 0.05:
+            return "STOP"
+        safe = guard.side_stop_m + 0.05
+        if action == ccw and obs.left_clearance_m < safe:
+            if obs.right_clearance_m >= safe:
+                action = cw
+            else:
+                action = "STOP"
+        elif action == cw and obs.right_clearance_m < safe:
+            if obs.left_clearance_m >= safe:
+                action = ccw
+            else:
+                action = "STOP"
+        return action
 
     def _pick_unstick_lateral_key(
         self,
@@ -320,6 +499,8 @@ class BearMissionHost(RosCommunicator):
         last_log_time: float,
         log_interval: float,
         prefix: str = "obstacle",
+        dp: DataProcessor | None = None,
+        source_debug_enabled: bool = False,
     ) -> float:
         now = time.monotonic()
         if now - last_log_time < log_interval:
@@ -330,10 +511,76 @@ class BearMissionHost(RosCommunicator):
             f"[{prefix}] front={obs.front_clearance_m:.2f}m "
             f"(raw={raw_str}m) "
             f"left={obs.left_clearance_m:.2f}m right={obs.right_clearance_m:.2f}m "
+            f"rear={obs.rear_clearance_m:.2f}m "
             f"min={obs.min_clearance_m:.2f}m scale={obs.speed_scale:.2f} "
+            f"bwd={obs.backward_speed_scale:.2f} "
             f"block={obs.block_cmd or 'none'}"
         )
+        if source_debug_enabled and obs.source_debug is not None:
+            sd = obs.source_debug
+            src_line = sd.format_compact()
+            if dp is not None:
+                hits = dp.get_lidar_sector_closest_hits()
+                left_hit = hits.get("left")
+                if left_hit is not None:
+                    span = left_hit.get("close_span_deg")
+                    span_str = f" span={span:.1f}°" if span is not None else ""
+                    robust = left_hit.get("robust_m")
+                    if robust is not None:
+                        src_line += (
+                            f" | lidar_raw={left_hit['raw_min_m']:.2f}m"
+                            f"@{left_hit['raw_min_angle_deg']:.0f}°"
+                            f"(robust={robust:.2f}m"
+                            f"{span_str} n={left_hit['hit_count']})"
+                        )
+                    else:
+                        src_line += (
+                            f" | lidar_raw={left_hit['raw_min_m']:.2f}m"
+                            f"@{left_hit['raw_min_angle_deg']:.0f}°"
+                            f"{span_str} n={left_hit['hit_count']}"
+                        )
+                if sd.depth_front_left is not None and sd.depth_left is not None:
+                    if (
+                        sd.depth_front_left <= sd.depth_left + 1e-4
+                        and sd.depth_left_combined is not None
+                    ):
+                        src_line += " | depth_patch=front_left(畫面左中上帶)"
+                    else:
+                        src_line += " | depth_patch=left(畫面最左欄上帶)"
+            self.get_logger().info(f"[{prefix}/src] {src_line}")
         return now
+
+    def _publish_backward_if_clear(
+        self,
+        dp: DataProcessor,
+        guard: ObstacleGuard,
+        enabled: bool,
+        approach_target_depth_m: float | None = None,
+        slow: bool = True,
+        approach_mode: bool = True,
+    ) -> bool:
+        """Publish BACKWARD only if rear clearance allows; return False if blocked."""
+        cmd = "BACKWARD_SLOW" if slow else "BACKWARD"
+        if not enabled:
+            self.publish_car_control(cmd)
+            return True
+        obs = self._evaluate_obstacles(
+            dp,
+            guard,
+            approach_target_depth_m=approach_target_depth_m,
+            approach_mode=approach_mode,
+        )
+        if obs.backward_speed_scale <= 0.05:
+            raw_r = obs.sensor_rear_m
+            raw_str = f"{raw_r:.2f}" if math.isfinite(raw_r) else "n/a"
+            self.get_logger().warn(
+                f"[rear/obstacle] Backward blocked — rear clearance "
+                f"{obs.rear_clearance_m:.2f}m (raw={raw_str}m)"
+            )
+            self.publish_car_control("STOP")
+            return False
+        self.publish_car_control(cmd)
+        return True
 
     def _apply_obstacle_motion(
         self,
@@ -348,6 +595,8 @@ class BearMissionHost(RosCommunicator):
         approach_target_depth_m: float | None = None,
         prefer_visual_yaw: bool = False,
         approach_mode: bool = False,
+        speed_scale_floor: float | None = None,
+        source_debug_enabled: bool = False,
     ) -> float:
         if not rclpy.ok():
             return last_log_time
@@ -365,25 +614,33 @@ class BearMissionHost(RosCommunicator):
             guard,
             approach_target_depth_m=approach_target_depth_m,
             approach_mode=approach_mode,
+            speed_scale_floor=speed_scale_floor,
         )
         last_log_time = self._log_obstacle_if_due(
-            obs, last_log_time, log_interval, prefix=prefix
+            obs,
+            last_log_time,
+            log_interval,
+            prefix=prefix,
+            dp=dp,
+            source_debug_enabled=source_debug_enabled,
         )
 
-        if (
-            obs.block_cmd
-            and obs.speed_scale <= 0.05
-            and not (prefer_visual_yaw and wheel_cmd is not None)
-        ):
-            if rclpy.ok():
-                self.publish_car_control(obs.block_cmd)
-            return last_log_time
-
         if wheel_cmd is not None:
+            allow_visual_yaw = prefer_visual_yaw and not guard.must_override_visual_yaw(
+                obs
+            )
             scaled = guard.apply_to_wheel_cmd(
-                wheel_cmd, obs, approach_mode=approach_mode
+                wheel_cmd,
+                obs,
+                approach_mode=approach_mode,
+                prefer_visual_yaw=allow_visual_yaw,
             )
             self.publish_raw_car_control(scaled)
+            return last_log_time
+
+        if obs.block_cmd and obs.speed_scale <= 0.05:
+            if rclpy.ok():
+                self.publish_car_control(obs.block_cmd)
             return last_log_time
 
         fwd = search_forward_speed * obs.speed_scale
@@ -420,6 +677,11 @@ class BearMissionHost(RosCommunicator):
             self.get_parameter("obstacle_log_interval_sec")
             .get_parameter_value()
             .double_value,
+        )
+        obstacle_source_debug_enabled = (
+            self.get_parameter("obstacle_source_debug_enabled")
+            .get_parameter_value()
+            .bool_value
         )
         last_obstacle_log = 0.0
         approach_dt = (
@@ -521,6 +783,64 @@ class BearMissionHost(RosCommunicator):
             self.get_parameter("visual_servo_lost_timeout_sec")
             .get_parameter_value()
             .double_value
+        )
+        approach_yolo_lost_grace_sec = (
+            self.get_parameter("approach_yolo_lost_grace_sec")
+            .get_parameter_value()
+            .double_value
+        )
+        approach_yolo_lost_grace_sec = max(0.3, approach_yolo_lost_grace_sec)
+        approach_yolo_lost_min_frames = int(
+            self.get_parameter("approach_yolo_lost_min_frames")
+            .get_parameter_value()
+            .integer_value
+        )
+        approach_yolo_lost_min_frames = max(3, approach_yolo_lost_min_frames)
+        approach_yolo_search_spin_speed_tier = (
+            self.get_parameter("approach_yolo_search_spin_speed_tier")
+            .get_parameter_value()
+            .string_value
+            .strip()
+            .lower()
+        )
+        if approach_yolo_search_spin_speed_tier not in (
+            "slow",
+            "median",
+            "fast",
+            "full",
+        ):
+            approach_yolo_search_spin_speed_tier = "slow"
+        approach_yolo_lost_search_circle_rad = (
+            self.get_parameter("approach_yolo_lost_search_circle_rad")
+            .get_parameter_value()
+            .double_value
+        )
+        approach_yolo_lost_search_circle_rad = max(
+            math.pi, approach_yolo_lost_search_circle_rad
+        )
+        approach_yolo_explore_forward_sec = (
+            self.get_parameter("approach_yolo_explore_forward_sec")
+            .get_parameter_value()
+            .double_value
+        )
+        approach_yolo_explore_forward_sec = max(
+            0.5, approach_yolo_explore_forward_sec
+        )
+        approach_yolo_explore_forward_speed = (
+            self.get_parameter("approach_yolo_explore_forward_speed")
+            .get_parameter_value()
+            .double_value
+        )
+        approach_yolo_explore_forward_speed = max(
+            40.0, approach_yolo_explore_forward_speed
+        )
+        approach_yolo_lost_motion_log_sec = (
+            self.get_parameter("approach_yolo_lost_motion_log_sec")
+            .get_parameter_value()
+            .double_value
+        )
+        approach_yolo_lost_motion_log_sec = max(
+            0.5, approach_yolo_lost_motion_log_sec
         )
         align_px = (
             self.get_parameter("align_pixel_thresh").get_parameter_value().double_value
@@ -654,6 +974,11 @@ class BearMissionHost(RosCommunicator):
         drop_at_home = (
             self.get_parameter("drop_at_home").get_parameter_value().bool_value
         )
+        drop_before_final_heading = (
+            self.get_parameter("drop_before_final_heading")
+            .get_parameter_value()
+            .bool_value
+        )
         amcl_wait = (
             self.get_parameter("amcl_wait_timeout_sec").get_parameter_value().double_value
         )
@@ -667,6 +992,10 @@ class BearMissionHost(RosCommunicator):
             self.get_logger().info(
                 f"ObstacleGuard profile={'unity' if use_unity else 'real'}: "
                 f"stop={obstacle_guard.stop_m:.2f}m slow={obstacle_guard.slow_m:.2f}m "
+                f"scale_floor far/mid/slow="
+                f"{self.get_parameter('obstacle_scale_floor_far').get_parameter_value().double_value:.2f}/"
+                f"{self.get_parameter('obstacle_scale_floor_mid').get_parameter_value().double_value:.2f}/"
+                f"{self.get_parameter('obstacle_scale_floor_slow').get_parameter_value().double_value:.2f} "
                 f"approach_guard={obstacle_guard_enabled} nav_guard={nav_obstacle_guard_enabled} "
                 f"nav_stop={nav_obstacle_stop_m:.2f}m"
             )
@@ -746,8 +1075,19 @@ class BearMissionHost(RosCommunicator):
         last_progress_dist = None
         last_progress_dx = None
         last_approach_unstick_time = 0.0
+        last_yolo_lost_motion_log = 0.0
+        last_yolo_hold_log = 0.0
+        last_target_valid_time = 0.0
+        held_ti = None
         approach_unstick_side = 1
         motion_progress = {"last_progress_time": time.monotonic(), "last_pose_xy": None}
+        yolo_search_state = {
+            "phase": "idle",
+            "accumulated_rad": 0.0,
+            "last_yaw": None,
+            "explore_until": 0.0,
+            "logged_spin": False,
+        }
         # 鎖定第一幀目標的方向，旋轉中不因 YOLO 抖動換目標
         locked_dx = None       # 鎖住的水平偏差（像素）
         locked_dx_time = None  # 鎖住的時間
@@ -756,41 +1096,118 @@ class BearMissionHost(RosCommunicator):
 
         while time.monotonic() - t_start < t_approach_max and rclpy.ok():
             ti = dp.get_yolo_target_info()
-            detected = ti is not None and len(ti) >= 3 and ti[0] == 1.0
-            dist = float(ti[1]) if detected else -1.0
-            raw_dx_fresh = float(ti[2]) if detected else 0.0
+            target_live = self._target_live(ti)
 
             # 深度突然跳遠（YOLO 換成下一隻熊 / 太近深度失效後重選）
+            if target_live:
+                live_dist = float(ti[1])
+                live_dx = float(ti[2])
+            else:
+                live_dist = -1.0
+                live_dx = 0.0
+
             if (
-                detected
-                and dist > 0.0
+                target_live
                 and prev_approach_dist is not None
                 and prev_approach_dist <= zone_slow * 1.35
-                and (dist - prev_approach_dist) >= grasp_depth_jump_m
+                and (live_dist - prev_approach_dist) >= grasp_depth_jump_m
             ):
                 aligned = True
                 self.get_logger().warn(
-                    f"[approach] Depth jumped away ({prev_approach_dist:.2f}→{dist:.2f}m) "
+                    f"[approach] Depth jumped away ({prev_approach_dist:.2f}→{live_dist:.2f}m) "
                     f"(>{grasp_depth_jump_m:.2f}m) — likely too close / YOLO re-target "
                     "→ brake → GRASP"
                 )
-                self.publish_car_control("BACKWARD_SLOW")
+                self._publish_backward_if_clear(
+                    dp,
+                    obstacle_guard,
+                    obstacle_guard_enabled,
+                    approach_target_depth_m=live_dist,
+                    slow=True,
+                )
                 time.sleep(0.22)
                 break
 
-            # 有效偵測 → 更新鎖定
-            if detected and dist > 0.0:
-                locked_dx = raw_dx_fresh
+            if target_live:
+                held_ti = list(ti)
+                last_target_valid_time = time.monotonic()
+                locked_dx = live_dx
                 locked_dx_time = time.monotonic()
                 lost_frames = 0
+                if yolo_search_state["phase"] != "idle":
+                    self.get_logger().info(
+                        "[approach/yolo_lost] target reacquired → resume approach"
+                    )
+                self._reset_yolo_search_state(yolo_search_state)
             else:
                 lost_frames += 1
 
+            since_valid = (
+                time.monotonic() - last_target_valid_time
+                if last_target_valid_time > 0.0
+                else float("inf")
+            )
+            in_hold = (
+                held_ti is not None
+                and since_valid < approach_yolo_lost_grace_sec
+                and lost_frames < approach_yolo_lost_min_frames
+            )
+            use_approach = target_live or in_hold
+            yolo_search_confirmed = not use_approach and (
+                held_ti is not None or last_valid_dist is not None
+            )
+
+            if in_hold:
+                now_hold_log = time.monotonic()
+                if now_hold_log - last_yolo_hold_log >= 1.0:
+                    hold_dist = (
+                        float(held_ti[1])
+                        if held_ti is not None and float(held_ti[1]) > 0.0
+                        else last_valid_dist
+                    )
+                    self.get_logger().info(
+                        "[approach/yolo_hold] brief dropout "
+                        f"({lost_frames} frames, {since_valid:.2f}s) "
+                        f"→ keep approaching last target "
+                        f"(dist={hold_dist if hold_dist is not None else 'n/a'}m)"
+                    )
+                    last_yolo_hold_log = now_hold_log
+
+            if yolo_search_confirmed and yolo_search_state["phase"] == "idle":
+                yolo_search_state["phase"] = "spin"
+                yolo_search_state["accumulated_rad"] = 0.0
+                yolo_search_state["last_yaw"] = None
+                if not yolo_search_state["logged_spin"]:
+                    ccw_action, _ = self._spin_action_names(
+                        approach_yolo_search_spin_speed_tier
+                    )
+                    self.get_logger().info(
+                        "[approach/yolo_lost] target lost (confirmed) → in-place search "
+                        f"(1 circle={math.degrees(approach_yolo_lost_search_circle_rad):.0f}° "
+                        f"spin={ccw_action}, "
+                        f"then explore {approach_yolo_explore_forward_sec:.1f}s forward)"
+                    )
+                    yolo_search_state["logged_spin"] = True
+
+            approach_ti = ti if target_live else held_ti
+            if use_approach and approach_ti is not None and len(approach_ti) >= 3:
+                detected = float(approach_ti[0]) == 1.0
+                dist = (
+                    float(approach_ti[1])
+                    if detected and float(approach_ti[1]) > 0.0
+                    else (last_valid_dist if last_valid_dist is not None else -1.0)
+                )
+                raw_dx_fresh = float(approach_ti[2])
+            else:
+                detected = False
+                dist = -1.0
+                raw_dx_fresh = 0.0
+
             # 轉向用「當前幀」像素偏差（置中控制），鎖定只用於目標選擇
-            raw_dx = raw_dx_fresh if (detected and dist > 0.0) else (locked_dx or 0.0)
+            raw_dx = raw_dx_fresh if use_approach else (locked_dx or 0.0)
 
             # 轉向卡住偵測：dx 長時間沒改善 → 暫時加大轉向力
-            if detected and dist > 0.0:
+            if use_approach and dist > 0.0:
                 cur_turn_err = abs(raw_dx_fresh - align_bias_px)
                 if (
                     last_turn_dx is None
@@ -807,24 +1224,24 @@ class BearMissionHost(RosCommunicator):
                     turn_stuck_boost = 1.45
 
             # 記錄最後有效距離 + 估算接近速度（深度變化率）
-            if detected and dist > 0.0:
+            if target_live:
                 now_sample = time.monotonic()
                 if prev_dist_sample is not None and prev_dist_sample_time is not None:
                     dt_s = now_sample - prev_dist_sample_time
                     if dt_s > 0.02:
                         instant_v = max(
-                            0.0, (prev_dist_sample - dist) / dt_s
+                            0.0, (prev_dist_sample - live_dist) / dt_s
                         )
                         closure_speed_mps = 0.65 * closure_speed_mps + 0.35 * instant_v
-                prev_dist_sample = dist
+                prev_dist_sample = live_dist
                 prev_dist_sample_time = now_sample
-                last_valid_dist = dist
+                last_valid_dist = live_dist
                 lost_frames = 0
 
                 # 接近進展偵測（距離縮短 / 置中改善 / 有接近速度）
                 progressed = False
-                cur_dx_err = abs(raw_dx_fresh - align_bias_px)
-                if last_progress_dist is not None and (last_progress_dist - dist) >= 0.04:
+                cur_dx_err = abs(live_dx - align_bias_px)
+                if last_progress_dist is not None and (last_progress_dist - live_dist) >= 0.04:
                     progressed = True
                 if last_progress_dx is not None and (last_progress_dx - cur_dx_err) >= 12.0:
                     progressed = True
@@ -833,19 +1250,51 @@ class BearMissionHost(RosCommunicator):
                 if progressed:
                     last_approach_progress_time = time.monotonic()
                     motion_progress["last_progress_time"] = time.monotonic()
-                last_progress_dist = dist
+                last_progress_dist = live_dist
                 last_progress_dx = cur_dx_err
-                prev_approach_dist = dist
-            else:
-                lost_frames += 1
+                prev_approach_dist = live_dist
 
+            amcl_pose = self.get_latest_amcl_pose()
+            progress_yaw_rad = 0.10 if yolo_search_confirmed else None
             self._update_motion_progress(
                 motion_progress,
-                self.get_latest_amcl_pose(),
+                amcl_pose,
                 motion_stuck_min_progress_m,
+                min_progress_yaw_rad=progress_yaw_rad,
             )
+            if yolo_search_confirmed and yolo_search_state["phase"] == "spin":
+                search_yaw_rad = self._track_yolo_search_yaw(
+                    yolo_search_state, amcl_pose
+                )
+                if search_yaw_rad >= approach_yolo_lost_search_circle_rad:
+                    yolo_search_state["phase"] = "explore"
+                    yolo_search_state["explore_until"] = (
+                        time.monotonic() + approach_yolo_explore_forward_sec
+                    )
+                    yolo_search_state["accumulated_rad"] = 0.0
+                    yolo_search_state["last_yaw"] = None
+                    self.get_logger().info(
+                        "[approach/yolo_lost] full circle without target "
+                        f"({math.degrees(search_yaw_rad):.0f}°) → explore forward "
+                        f"{approach_yolo_explore_forward_sec:.1f}s"
+                    )
+            elif (
+                yolo_search_confirmed
+                and yolo_search_state["phase"] == "explore"
+                and time.monotonic() >= yolo_search_state["explore_until"]
+            ):
+                yolo_search_state["phase"] = "spin"
+                yolo_search_state["accumulated_rad"] = 0.0
+                yolo_search_state["last_yaw"] = None
+                self.get_logger().info(
+                    "[approach/yolo_lost] explore finished, still no target "
+                    "→ search spin again"
+                )
 
             d_eff = last_valid_dist if last_valid_dist is not None else 9.9
+            obs_scale_floor = self._obstacle_speed_scale_floor(
+                d_eff, zone_far, zone_mid
+            )
 
             obs_for_stuck = (
                 self._evaluate_obstacles(
@@ -853,6 +1302,7 @@ class BearMissionHost(RosCommunicator):
                     obstacle_guard,
                     approach_target_depth_m=last_valid_dist,
                     approach_mode=True,
+                    speed_scale_floor=obs_scale_floor,
                 )
                 if obstacle_guard_enabled
                 else None
@@ -860,22 +1310,30 @@ class BearMissionHost(RosCommunicator):
             wall_stuck = False
             if obs_for_stuck is not None:
                 sf = obs_for_stuck.sensor_front_m
+                bear_ahead = (
+                    target_live
+                    and live_dist > 0.0
+                    and math.isfinite(sf)
+                    and live_dist > sf + 0.25
+                )
                 wall_stuck = (
                     math.isfinite(sf)
                     and sf < obstacle_guard.stop_m + 0.08
+                    and not bear_ahead
                 ) or (
                     min(
-                        _finite_clearance(obs_for_stuck.sensor_left_m),
-                        _finite_clearance(obs_for_stuck.sensor_right_m),
+                        obs_for_stuck.left_clearance_m,
+                        obs_for_stuck.right_clearance_m,
                     )
                     < obstacle_guard.side_stop_m + 0.06
+                    and not bear_ahead
                 )
             skip_unstick = (
-                detected
+                use_approach
                 and dist > 0.0
                 and dist <= zone_mid
                 and not wall_stuck
-            )
+            ) or (yolo_search_confirmed and not wall_stuck)
 
             # ── 通用脫困：AMCL/接近無進展 > N 秒（YOLO 丟失或貼牆也觸發）──
             if (
@@ -891,10 +1349,13 @@ class BearMissionHost(RosCommunicator):
                     shift_sec=approach_stuck_shift_sec,
                     forward_sec=approach_stuck_forward_sec,
                     side_sign=approach_unstick_side,
-                    yolo_lost=not (detected and dist > 0.0),
+                    yolo_lost=yolo_search_confirmed,
                     search_spin_speed=visual_servo_search_spin_speed,
-                    dx_px=raw_dx_fresh if (detected and dist > 0.0) else locked_dx,
+                    dx_px=raw_dx_fresh if use_approach else locked_dx,
                     use_lidar_for_unstick=obstacle_guard_enabled,
+                    approach_target_depth_m=(
+                        live_dist if target_live else last_valid_dist
+                    ),
                 )
                 last_approach_unstick_time = time.monotonic()
                 self._reset_motion_progress(motion_progress)
@@ -913,8 +1374,8 @@ class BearMissionHost(RosCommunicator):
                 last_valid_dist is not None
                 and last_valid_dist <= zone_slow * 1.15
                 and (
-                    not (detected and dist > 0.0)
-                    or (detected and dist <= 0.0)
+                    not target_live
+                    or live_dist <= 0.0
                 )
                 and lost_frames >= 1
             ):
@@ -923,13 +1384,21 @@ class BearMissionHost(RosCommunicator):
                     f"[approach] Target lost/invalid near grasp "
                     f"(last_dist={last_valid_dist:.2f}m, lost={lost_frames}) → brake → GRASP"
                 )
-                self.publish_car_control("BACKWARD_SLOW")
+                self._publish_backward_if_clear(
+                    dp,
+                    obstacle_guard,
+                    obstacle_guard_enabled,
+                    approach_target_depth_m=(
+                        live_dist if target_live else last_valid_dist
+                    ),
+                    slow=True,
+                )
                 time.sleep(0.22)
                 break
 
             # ── 觸發：熊靠太近消失（最後距離 ≤ zone_slow*1.4，連失 N 幀）──
             if (
-                not (detected and dist > 0.0)
+                not target_live
                 and last_valid_dist is not None
                 and last_valid_dist <= zone_slow * 1.4
                 and lost_frames >= grasp_trigger_lost_frames
@@ -943,14 +1412,20 @@ class BearMissionHost(RosCommunicator):
 
             # ── 觸發：進入 grasp zone，且畫面已置中 → 主動煞車 ──
             grasp_center_thresh = align_px * 1.5   # 夾取前 dx 門檻（比接近門檻寬一點）
-            if detected and dist > 0.0 and dist <= zone_slow + 0.12:
+            if use_approach and dist > 0.0 and dist <= zone_slow + 0.12:
                 if abs(raw_dx) <= grasp_center_thresh:
                     self.get_logger().info(
                         f"[approach] Grasp zone reached & centered: "
                         f"dist={dist:.2f}m, dx={raw_dx:.0f}px → brake → GRASP"
                     )
                     brake_sec = 0.18 if last_valid_dist is not None and last_valid_dist < zone_mid else 0.10
-                    self.publish_car_control("BACKWARD_SLOW")
+                    self._publish_backward_if_clear(
+                        dp,
+                        obstacle_guard,
+                        obstacle_guard_enabled,
+                        approach_target_depth_m=dist,
+                        slow=True,
+                    )
                     time.sleep(brake_sec)
                     aligned = True
                     break
@@ -972,7 +1447,7 @@ class BearMissionHost(RosCommunicator):
 
             # ── log（加快到 0.35 秒一次）──
             now_t = time.monotonic()
-            if detected and now_t - last_approach_log >= 0.35:
+            if use_approach and now_t - last_approach_log >= 0.35:
                 d_eff = last_valid_dist if last_valid_dist is not None else dist
                 if d_eff is not None:
                     margin = max(0.0, d_eff - approach_stop_dist_m)
@@ -1004,32 +1479,67 @@ class BearMissionHost(RosCommunicator):
             # ── 行進速度：煞車距離前瞻 + 連續視覺轉向 + 障礙護欄 ──
             d = last_valid_dist if last_valid_dist is not None else 9.9
             approach_depth_hint = (
-                float(dist) if (detected and dist > 0.0) else last_valid_dist
+                live_dist if target_live else last_valid_dist
             )
-            if not (detected and dist > 0.0):
+            if not use_approach:
                 obs_search = self._evaluate_obstacles(
                     dp,
                     obstacle_guard,
                     approach_target_depth_m=approach_depth_hint,
                     approach_mode=True,
+                    speed_scale_floor=obs_scale_floor,
                 )
-                search_cmd = self._yolo_search_wheel_cmd(
-                    visual_servo_search_spin_speed,
-                    obs=obs_search if obstacle_guard_enabled else None,
-                    dx_px=locked_dx,
-                )
-                last_obstacle_log = self._apply_obstacle_motion(
-                    dp,
-                    obstacle_guard,
-                    obstacle_guard_enabled,
-                    obstacle_log_interval,
+                last_obstacle_log = self._log_obstacle_if_due(
+                    obs_search,
                     last_obstacle_log,
-                    wheel_cmd=search_cmd,
+                    obstacle_log_interval,
                     prefix="approach/obstacle",
-                    approach_target_depth_m=approach_depth_hint,
-                    prefer_visual_yaw=True,
-                    approach_mode=True,
+                    dp=dp,
+                    source_debug_enabled=obstacle_source_debug_enabled,
                 )
+                if yolo_search_state["phase"] == "explore":
+                    explore_cmd = [
+                        approach_yolo_explore_forward_speed
+                    ] * 4
+                    if obstacle_guard_enabled:
+                        scaled = obstacle_guard.apply_to_wheel_cmd(
+                            explore_cmd,
+                            obs_search,
+                            approach_mode=True,
+                            prefer_visual_yaw=False,
+                        )
+                        self.publish_raw_car_control(scaled)
+                    else:
+                        self.publish_car_control("FORWARD_SLOW")
+                else:
+                    spin_action = self._pick_yolo_lost_spin_action(
+                        obstacle_guard,
+                        obs_search,
+                        locked_dx,
+                        spin_tier=approach_yolo_search_spin_speed_tier,
+                    )
+                    if spin_action == "STOP":
+                        self.publish_car_control("STOP")
+                    else:
+                        self.publish_car_control(spin_action)
+                now_lost_log = time.monotonic()
+                if now_lost_log - last_yolo_lost_motion_log >= approach_yolo_lost_motion_log_sec:
+                    acc_deg = math.degrees(
+                        float(yolo_search_state.get("accumulated_rad", 0.0))
+                    )
+                    motion_label = (
+                        "explore_forward"
+                        if yolo_search_state["phase"] == "explore"
+                        else spin_action
+                    )
+                    self.get_logger().info(
+                        "[approach/yolo_lost] phase="
+                        f"{yolo_search_state['phase']} action={motion_label} "
+                        f"search_yaw={acc_deg:.0f}° "
+                        f"scale={obs_search.speed_scale:.2f} "
+                        f"block={obs_search.block_cmd or 'none'}"
+                    )
+                    last_yolo_lost_motion_log = now_lost_log
             else:
                 margin = max(0.0, d - approach_stop_dist_m)
                 fwd_wheel = self._lookahead_forward_wheel_speed(
@@ -1043,7 +1553,7 @@ class BearMissionHost(RosCommunicator):
                 )
                 # 已對準且進入 pre-grasp 區：再压低前進上限
                 if (
-                    detected
+                    use_approach
                     and dist > 0.0
                     and dist <= zone_slow + 0.45
                     and abs(raw_dx_fresh) <= align_px * 1.5
@@ -1057,7 +1567,7 @@ class BearMissionHost(RosCommunicator):
                 center_first = (
                     margin < (zone_mid - approach_stop_dist_m)
                     or (
-                        detected
+                        use_approach
                         and dist > 0.0
                         and dist <= 1.05
                         and abs(raw_dx_fresh) <= vs_center_deadband_px * 1.4
@@ -1085,6 +1595,7 @@ class BearMissionHost(RosCommunicator):
                     yaw_soft_scale_px=visual_servo_yaw_soft_scale_px,
                     min_yaw_large_px=visual_servo_min_yaw_large_px,
                     pixel_offset_bias_px=align_bias_px,
+                    yolo_target_info=approach_ti,
                 )
                 last_obstacle_log = self._apply_obstacle_motion(
                     dp,
@@ -1097,6 +1608,8 @@ class BearMissionHost(RosCommunicator):
                     approach_target_depth_m=approach_depth_hint,
                     prefer_visual_yaw=True,
                     approach_mode=True,
+                    speed_scale_floor=obs_scale_floor,
+                    source_debug_enabled=obstacle_source_debug_enabled,
                 )
 
             if not rclpy.ok():
@@ -1140,6 +1653,13 @@ class BearMissionHost(RosCommunicator):
         goal_pose.header.frame_id = "map"
         goal_pose.header.stamp = self.get_clock().now().to_msg()
         goal_pose.pose = copy.deepcopy(home_pose)
+        if drop_before_final_heading:
+            cur_for_goal = self.get_latest_amcl_pose()
+            if cur_for_goal is not None:
+                # Nav2 只要求回到 home XY；最終面向稍後手動對齊
+                goal_pose.pose.orientation = copy.deepcopy(
+                    cur_for_goal.pose.pose.orientation
+                )
 
         nav_goal = NavigateToPose.Goal()
         nav_goal.pose = goal_pose
@@ -1183,6 +1703,7 @@ class BearMissionHost(RosCommunicator):
                     last_nav_obstacle_log = 0.0
                     last_nav_obstacle_check = 0.0
                     nav_aborted_by_guard = False
+                    nav_xy_reached_early = False
                     while not result_future.done() and time.monotonic() - t_nav < nav_timeout:
                         now_nav = time.monotonic()
                         if (
@@ -1196,11 +1717,17 @@ class BearMissionHost(RosCommunicator):
                                 last_nav_obstacle_log,
                                 obstacle_log_interval,
                                 prefix="nav/obstacle",
+                                dp=dp,
+                                source_debug_enabled=obstacle_source_debug_enabled,
                             )
-                            if obs_nav.front_clearance_m < nav_obstacle_stop_m:
+                            nav_front_raw = obs_nav.sensor_front_m
+                            if (
+                                math.isfinite(nav_front_raw)
+                                and nav_front_raw < nav_obstacle_stop_m
+                            ):
                                 self.get_logger().warn(
-                                    f"[nav/obstacle] Front clearance "
-                                    f"{obs_nav.front_clearance_m:.2f}m < "
+                                    f"[nav/obstacle] Front sensor "
+                                    f"{nav_front_raw:.2f}m < "
                                     f"{nav_obstacle_stop_m:.2f}m — cancel Nav2 goal."
                                 )
                                 cancel_future = goal_handle.cancel_goal_async()
@@ -1227,6 +1754,27 @@ class BearMissionHost(RosCommunicator):
                             ):
                                 self._last_nav_progress_time = time.monotonic()
 
+                            if (
+                                drop_before_final_heading
+                                and d_home_now <= home_reached_thresh
+                            ):
+                                self.get_logger().info(
+                                    "[nav] Home XY reached — stopping Nav2 before "
+                                    "final heading (drop-first mode)."
+                                )
+                                cancel_future = goal_handle.cancel_goal_async()
+                                t_cancel = time.monotonic()
+                                while (
+                                    not cancel_future.done()
+                                    and time.monotonic() - t_cancel < 2.0
+                                ):
+                                    time.sleep(0.02)
+                                self.publish_car_control("STOP")
+                                nav_succeeded = True
+                                nav_xy_reached_early = True
+                                status = GoalStatus.STATUS_SUCCEEDED
+                                break
+
                         # 若長時間幾乎無進展，主動取消本次導航，交給 retry 流程
                         if (
                             self._last_home_dist is not None
@@ -1251,7 +1799,11 @@ class BearMissionHost(RosCommunicator):
                             break
                         time.sleep(0.05)
 
-                    if result_future.done():
+                    if nav_xy_reached_early:
+                        self.get_logger().info(
+                            "[nav] Treating early XY arrival as success (drop-first mode)."
+                        )
+                    elif result_future.done():
                         nav_result = result_future.result()
                         status = nav_result.status
                         status_text = self._GOAL_STATUS_TEXT.get(
@@ -1280,7 +1832,13 @@ class BearMissionHost(RosCommunicator):
                 )
                 self._clear_costmaps_once()
                 if nav_unstick_enabled:
-                    self._unstick_maneuver(nav_unstick_back_sec, nav_unstick_rotate_sec)
+                    self._unstick_maneuver(
+                        nav_unstick_back_sec,
+                        nav_unstick_rotate_sec,
+                        dp=dp,
+                        guard=obstacle_guard,
+                        obstacle_guard_enabled=nav_obstacle_guard_enabled,
+                    )
                 time.sleep(0.6)
             else:
                 self.get_logger().warn("[nav] Retries exhausted.")
@@ -1319,6 +1877,7 @@ class BearMissionHost(RosCommunicator):
                 heading_thresh_deg=fallback_heading_thresh_deg,
                 rotate_step_sec=fallback_rotate_step_sec,
                 forward_step_sec=fallback_forward_step_sec,
+                align_heading_at_end=not drop_before_final_heading,
             )
             if fallback_ok:
                 nav_succeeded = True
@@ -1353,6 +1912,21 @@ class BearMissionHost(RosCommunicator):
             )
         else:
             self.get_logger().info("drop_at_home=false, skip release.")
+
+        if drop_before_final_heading and close_to_home:
+            self.get_logger().info(
+                "Aligning to recorded home heading after release …"
+            )
+            heading_ok = self._align_home_heading(
+                home_pose=home_pose,
+                timeout_sec=fallback_home_timeout_sec,
+                heading_thresh_deg=fallback_heading_thresh_deg,
+                rotate_step_sec=fallback_rotate_step_sec,
+            )
+            if heading_ok:
+                self.get_logger().info("[home] Final heading aligned.")
+            else:
+                self.get_logger().warn("[home] Final heading alignment failed or timed out.")
 
     def _clear_costmaps_once(self):
         try:
@@ -1425,10 +1999,17 @@ class BearMissionHost(RosCommunicator):
             f"amcl_home_dist={self._last_home_dist if self._last_home_dist is not None else 'n/a'}"
         )
 
-    def _unstick_maneuver(self, back_sec: float, rotate_sec: float):
+    def _unstick_maneuver(
+        self,
+        back_sec: float,
+        rotate_sec: float,
+        dp: DataProcessor | None = None,
+        guard: ObstacleGuard | None = None,
+        obstacle_guard_enabled: bool = False,
+    ):
         """
         Nav2 卡住時，先執行短暫脫困再重送 goal：
-        1) 慢速後退
+        1) 慢速後退（僅後方淨空時）
         2) 慢速左旋
         3) 慢速右旋
         """
@@ -1436,8 +2017,22 @@ class BearMissionHost(RosCommunicator):
             f"[nav] Unstick maneuver: back={back_sec:.2f}s, rotate_each={rotate_sec:.2f}s"
         )
         if back_sec > 0.0:
-            self.publish_car_control("BACKWARD_SLOW")
-            time.sleep(back_sec)
+            if dp is not None and guard is not None:
+                if not self._publish_backward_if_clear(
+                    dp,
+                    guard,
+                    obstacle_guard_enabled,
+                    approach_mode=False,
+                    slow=True,
+                ):
+                    self.get_logger().warn(
+                        "[nav] Skip backward unstick — rear obstacle detected."
+                    )
+                else:
+                    time.sleep(back_sec)
+            else:
+                self.publish_car_control("BACKWARD_SLOW")
+                time.sleep(back_sec)
         if rotate_sec > 0.0:
             self.publish_car_control("COUNTERCLOCKWISE_ROTATION")
             time.sleep(rotate_sec)
@@ -1458,13 +2053,19 @@ class BearMissionHost(RosCommunicator):
         search_spin_speed: float = 70.0,
         dx_px: float | None = None,
         use_lidar_for_unstick: bool = True,
+        approach_target_depth_m: float | None = None,
     ):
         """
         通用脫困：後退 →（安全時）往開闊側平移 → 短前進。
         YOLO 丟失：後退 → 原地搜尋轉圈（不側移、不前進）。
         """
         obs = (
-            self._evaluate_obstacles(dp, guard, approach_mode=True)
+            self._evaluate_obstacles(
+                dp,
+                guard,
+                approach_target_depth_m=approach_target_depth_m,
+                approach_mode=True,
+            )
             if use_lidar_for_unstick
             else None
         )
@@ -1497,8 +2098,18 @@ class BearMissionHost(RosCommunicator):
         self.publish_car_control("STOP")
         time.sleep(0.08)
         if back_sec > 0.0:
-            self.publish_car_control("BACKWARD_SLOW")
-            time.sleep(back_sec)
+            if self._publish_backward_if_clear(
+                dp,
+                guard,
+                use_lidar_for_unstick,
+                approach_target_depth_m=approach_target_depth_m,
+                slow=True,
+            ):
+                time.sleep(back_sec)
+            else:
+                self.get_logger().warn(
+                    "[motion] Skip backward unstick — rear obstacle detected."
+                )
         if yolo_lost:
             self.publish_raw_car_control(spin_cmd)
             time.sleep(0.65)
@@ -1558,6 +2169,41 @@ class BearMissionHost(RosCommunicator):
         self.publish_car_control("STOP")
         time.sleep(0.15)
 
+    def _align_home_heading(
+        self,
+        home_pose,
+        timeout_sec: float,
+        heading_thresh_deg: float,
+        rotate_step_sec: float,
+    ) -> bool:
+        """在 home XY 附近，將車體轉回任務開始時記錄的面向。"""
+        heading_thresh = math.radians(heading_thresh_deg)
+        home_yaw = self._yaw_from_quat(home_pose.orientation)
+        t0 = time.monotonic()
+        while rclpy.ok() and time.monotonic() - t0 < timeout_sec:
+            amcl_pose_msg = self.get_latest_amcl_pose()
+            if amcl_pose_msg is None:
+                self.publish_car_control("STOP")
+                time.sleep(0.05)
+                continue
+
+            curr_yaw = self._yaw_from_quat(amcl_pose_msg.pose.pose.orientation)
+            yaw_err = self._normalize_angle(home_yaw - curr_yaw)
+            if abs(yaw_err) <= heading_thresh:
+                self.publish_car_control("STOP")
+                return True
+            self.publish_car_control(
+                "COUNTERCLOCKWISE_ROTATION"
+                if yaw_err > 0.0
+                else "CLOCKWISE_ROTATION"
+            )
+            time.sleep(rotate_step_sec)
+            self.publish_car_control("STOP")
+            time.sleep(0.03)
+
+        self.publish_car_control("STOP")
+        return False
+
     def _fallback_drive_home(
         self,
         home_pose,
@@ -1566,15 +2212,15 @@ class BearMissionHost(RosCommunicator):
         heading_thresh_deg: float,
         rotate_step_sec: float,
         forward_step_sec: float,
+        align_heading_at_end: bool = True,
     ) -> bool:
         """
         當 Nav2 異常時，用 AMCL 做簡單閉迴路回家：
         1) 面向 home 方向
         2) 前進直到進入 home 半徑
-        3) 最後對齊 home 原始朝向
+        3) （可選）對齊 home 原始朝向
         """
         heading_thresh = math.radians(heading_thresh_deg)
-        home_yaw = self._yaw_from_quat(home_pose.orientation)
         t0 = time.monotonic()
         last_log = 0.0
         phase = "goto"
@@ -1599,20 +2245,15 @@ class BearMissionHost(RosCommunicator):
                 last_log = now
 
             if dist <= arrival_xy_thresh_m:
-                phase = "final_heading"
-                yaw_err = self._normalize_angle(home_yaw - curr_yaw)
-                if abs(yaw_err) <= heading_thresh:
-                    self.publish_car_control("STOP")
-                    return True
-                self.publish_car_control(
-                    "COUNTERCLOCKWISE_ROTATION"
-                    if yaw_err > 0.0
-                    else "CLOCKWISE_ROTATION"
-                )
-                time.sleep(rotate_step_sec)
                 self.publish_car_control("STOP")
-                time.sleep(0.03)
-                continue
+                if not align_heading_at_end:
+                    return True
+                return self._align_home_heading(
+                    home_pose=home_pose,
+                    timeout_sec=max(3.0, timeout_sec - (time.monotonic() - t0)),
+                    heading_thresh_deg=heading_thresh_deg,
+                    rotate_step_sec=rotate_step_sec,
+                )
 
             phase = "goto"
             heading_to_home = math.atan2(dy, dx)

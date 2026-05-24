@@ -1,5 +1,7 @@
 import math
 import os
+import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -27,9 +29,15 @@ class YoloDetectionNode(Node):
         self.declare_parameter("publish_sector_min_depth", True)
         self.declare_parameter("sector_depth_min_m", 0.40)
         self.declare_parameter("sector_depth_max_m", 12.0)
+        self.declare_parameter("draw_sector_debug_overlay", True)
         self.declare_parameter("weights_path", "")
         # nearest: 多隻目標時選深度最近（最適合直接接近）; confidence: 選信心最高
         self.declare_parameter("target_select_mode", "nearest")
+        self.declare_parameter("lock_ref_lookback_sec", 1.0)
+        self.declare_parameter("lock_max_depth_rate_mps", 2.5)
+        self.declare_parameter("lock_max_depth_jump_away_m", 0.45)
+        self.declare_parameter("lock_pixel_match_max_px", 100.0)
+        self.declare_parameter("lock_reselect_delay_sec", 2.0)
 
         self.target_class = (
             self.get_parameter("target_class").get_parameter_value().string_value.strip()
@@ -60,6 +68,12 @@ class YoloDetectionNode(Node):
         self._sector_depth_max_m = (
             self.get_parameter("sector_depth_max_m").get_parameter_value().double_value
         )
+        self.draw_sector_debug_overlay = (
+            self.get_parameter("draw_sector_debug_overlay")
+            .get_parameter_value()
+            .bool_value
+        )
+        self._last_sector_depths: list[float] | None = None
         self.target_select_mode = (
             self.get_parameter("target_select_mode")
             .get_parameter_value()
@@ -72,10 +86,40 @@ class YoloDetectionNode(Node):
         self.bridge = CvBridge()
         self._lock_cx = None        # 鎖定目標的畫面 x（像素）
         self._lock_cy = None        # 鎖定目標的畫面 y（像素）
-        self._lock_depth = None     # 鎖定時的深度
-        self._lock_init_depth = None  # 第一次鎖定時的深度（不隨靠近更新）
+        self._lock_depth = None     # 上一幀成功追蹤的深度
         self._lock_lost_since = None
-        self._lock_reselect_delay = 2.0
+        self._lock_ref_lookback_sec = max(
+            0.2,
+            self.get_parameter("lock_ref_lookback_sec")
+            .get_parameter_value()
+            .double_value,
+        )
+        self._lock_max_depth_rate_mps = max(
+            0.3,
+            self.get_parameter("lock_max_depth_rate_mps")
+            .get_parameter_value()
+            .double_value,
+        )
+        self._lock_max_depth_jump_away_m = max(
+            0.15,
+            self.get_parameter("lock_max_depth_jump_away_m")
+            .get_parameter_value()
+            .double_value,
+        )
+        self._lock_pixel_match_max_px = max(
+            40.0,
+            self.get_parameter("lock_pixel_match_max_px")
+            .get_parameter_value()
+            .double_value,
+        )
+        self._lock_reselect_delay = max(
+            0.5,
+            self.get_parameter("lock_reselect_delay_sec")
+            .get_parameter_value()
+            .double_value,
+        )
+        # (monotonic_time, depth_m, cx, cy) — 供與 ~1s 前狀態比對，避免用初始深度鎖定
+        self._lock_track_history: deque = deque(maxlen=60)
 
         self.latest_depth_image_raw = None
         self.latest_depth_image_compressed = None
@@ -259,6 +303,8 @@ class YoloDetectionNode(Node):
         self.publish_x_multi_depths(processed_image)
         if self.publish_sector_min_depth:
             self.publish_sector_min_depths()
+        if self.draw_sector_debug_overlay:
+            processed_image = self.overlay_sector_depth_debug(processed_image)
 
         # 發佈處理後的影像
         self.publish_image(processed_image)
@@ -365,36 +411,72 @@ class YoloDetectionNode(Node):
                 self._lock_cx = float(cx)
                 self._lock_cy = float(cy)
                 self._lock_depth = float(depth_value)
-                # 只在第一次鎖定時記錄初始深度，之後不更新
-                if self._lock_init_depth is None:
-                    self._lock_init_depth = float(depth_value)
                 self._lock_lost_since = None
+                self._lock_track_history.append(
+                    (time.monotonic(), float(depth_value), float(cx), float(cy))
+                )
 
                 if self.publish_target_marker:
                     self._publish_bear_marker(cx, cy, depth_value, class_name)
         else:
-            import time as _time
             if self._lock_lost_since is None:
-                self._lock_lost_since = _time.monotonic()
+                self._lock_lost_since = time.monotonic()
             # 鎖定消失超過 reselect_delay 才清除，避免旋轉時瞬間換目標
-            if _time.monotonic() - self._lock_lost_since > self._lock_reselect_delay:
-                self._lock_cx = None
-                self._lock_cy = None
-                self._lock_depth = None
-                self._lock_init_depth = None
-                self._lock_lost_since = None
+            if time.monotonic() - self._lock_lost_since > self._lock_reselect_delay:
+                self._clear_target_lock()
 
         self.publish_target_info(found_target, target_distance, delta_x)
         return image
+
+    def _clear_target_lock(self) -> None:
+        self._lock_cx = None
+        self._lock_cy = None
+        self._lock_depth = None
+        self._lock_lost_since = None
+        self._lock_track_history.clear()
+
+    def _get_lock_reference(self):
+        """取約 lock_ref_lookback_sec 前的 (depth, cx, cy, ref_age_sec) 作為比對基準。"""
+        now = time.monotonic()
+        lookback = self._lock_ref_lookback_sec
+
+        if self._lock_track_history:
+            target_t = now - lookback
+            ref_entry = None
+            for entry in self._lock_track_history:
+                t, depth, cx, cy = entry
+                if t <= target_t and (ref_entry is None or t > ref_entry[0]):
+                    ref_entry = entry
+            if ref_entry is None:
+                ref_entry = self._lock_track_history[0]
+            t, depth, cx, cy = ref_entry
+            return float(depth), float(cx), float(cy), max(0.0, now - t)
+
+        if self._lock_depth is not None:
+            return (
+                float(self._lock_depth),
+                float(self._lock_cx or 0.0),
+                float(self._lock_cy or 0.0),
+                0.0,
+            )
+        return None, None, None, 0.0
+
+    @staticmethod
+    def _target_match_cost(row, ref_depth, ref_cx, ref_cy) -> float:
+        _, _, _, _, _, _, cx, cy, depth = row
+        px_dist = math.hypot(float(cx) - ref_cx, float(cy) - ref_cy)
+        depth_diff = abs(float(depth) - ref_depth)
+        return px_dist * 0.02 + depth_diff
 
     def _select_primary_target(self, scored):
         """多隻熊時選一隻作為導航目標。
 
         鎖定策略：
         - 未鎖定：選畫面中最近的熊（depth 最小）
-        - 已鎖定：用「初始鎖定深度」比對，找深度最接近的那隻繼續跟
-          （不用當前深度，避免靠近後鎖定漂移到另一隻）
-        - 若所有候選與初始深度相差 > 1.0m，代表原本那隻消失，重新選最近
+        - 已鎖定：與 **約 1 秒前**（lock_ref_lookback_sec）的 depth/cx/cy 比對
+          - 允許同一幀內深度明顯變小（靠近）
+          - 拒絕深度突然變遠（跳去另一隻熊 / 深度失效後重選）
+        - 比對失敗時回傳 None（暫時 lost），**不**立刻改跟「最近」那隻
         """
         valid = [row for row in scored if row[8] > 0.05]
         if not valid:
@@ -403,17 +485,41 @@ class YoloDetectionNode(Node):
         if self.target_select_mode == "confidence":
             return max(valid, key=lambda t: t[0])
 
-        # 已鎖定：用初始深度（不隨靠近更新）來識別同一隻熊
-        ref_depth = self._lock_init_depth if self._lock_init_depth is not None else self._lock_depth
-        if ref_depth is not None:
-            by_match = sorted(valid, key=lambda t: abs(float(t[8]) - ref_depth))
-            best = by_match[0]
-            # 容許深度差在 1.0m 以內（從 2m 靠近到 0.4m 的過程中一定涵蓋）
-            if abs(float(best[8]) - ref_depth) < 1.0:
-                return best
+        ref_depth, ref_cx, ref_cy, ref_age = self._get_lock_reference()
+        if ref_depth is None:
+            return min(valid, key=lambda t: t[8])
 
-        # 未鎖定或鎖定目標消失：選畫面中最近的
-        return min(valid, key=lambda t: t[8])
+        best = min(
+            valid,
+            key=lambda row: self._target_match_cost(row, ref_depth, ref_cx, ref_cy),
+        )
+        _, _, _, _, _, _, cx, cy, depth = best
+        depth_f = float(depth)
+        px_dist = math.hypot(float(cx) - ref_cx, float(cy) - ref_cy)
+        depth_diff = abs(depth_f - ref_depth)
+        depth_jump_away = depth_f - ref_depth
+        approach_drop = ref_depth - depth_f  # >0 代表比參考點更近（正常逼近）
+
+        # 允許在 lookback 時間內以 max rate 靠近；對稱小誤差也接受
+        max_approach_drop = (
+            self._lock_max_depth_rate_mps
+            * max(ref_age, self._lock_ref_lookback_sec * 0.5)
+            + 0.35
+        )
+        depth_tol = max(0.35, self._lock_max_depth_rate_mps * max(ref_age, 0.05))
+
+        closer_ok = approach_drop >= -0.08 and approach_drop <= max_approach_drop
+        steady_ok = depth_diff <= depth_tol
+        pixel_ok = px_dist <= self._lock_pixel_match_max_px
+        not_jump_away = depth_jump_away <= self._lock_max_depth_jump_away_m
+
+        if not_jump_away and (
+            closer_ok or steady_ok or (pixel_ok and depth_diff <= depth_tol * 1.5)
+        ):
+            return best
+
+        # 仍鎖定中但本幀對不上：視為 lost，不要 fall back 到最近熊
+        return None
 
     def get_depth_median(self, cx, cy, radius=4):
         vals = []
@@ -485,18 +591,23 @@ class YoloDetectionNode(Node):
 
     def publish_sector_min_depths(self):
         """
-        發布 5 方向最小深度（公尺）:
-        [front, front_left, left, front_right, right]
+        發布 6 個深度值（公尺）:
+        [front, front_left, left, front_right, right, rear]
+
+        - 前 5 項：畫面上方帶 (35%–55% 高)，供前進避障（不含後輪後地面）
+        - rear：畫面下方帶 (55%–100% 高) 全寬最小深度，供後退避障
         """
         depth_m = self._depth_image_meters()
         if depth_m is None:
             return
 
         h, w = depth_m.shape[:2]
-        y0 = int(h * 0.35)
-        y1 = h
-        if y1 <= y0:
-            y0, y1 = 0, h
+        y_fwd0 = int(h * 0.35)
+        y_fwd1 = max(y_fwd0 + 1, int(h * 0.55))
+        y_rear0 = y_fwd1
+        y_rear1 = h
+        if y_fwd1 <= y_fwd0:
+            y_fwd0, y_fwd1 = 0, max(1, h // 2)
 
         col_w = max(1, w // 5)
         bands = [
@@ -507,15 +618,16 @@ class YoloDetectionNode(Node):
             (4 * col_w, w),
         ]
 
-        def band_min(col_idx: int) -> float:
+        def band_min(col_idx: int, y0: int, y1: int) -> float:
             x0, x1 = bands[col_idx]
             return self._sector_patch_min(depth_m, y0, y1, x0, x1)
 
-        front = band_min(2)
-        front_left = band_min(1)
-        left = band_min(0)
-        front_right = band_min(3)
-        right = band_min(4)
+        front = band_min(2, y_fwd0, y_fwd1)
+        front_left = band_min(1, y_fwd0, y_fwd1)
+        left = band_min(0, y_fwd0, y_fwd1)
+        front_right = band_min(3, y_fwd0, y_fwd1)
+        right = band_min(4, y_fwd0, y_fwd1)
+        rear = self._sector_patch_min(depth_m, y_rear0, y_rear1, 0, w)
 
         msg = Float32MultiArray()
         msg.data = [
@@ -524,8 +636,83 @@ class YoloDetectionNode(Node):
             float(left),
             float(front_right),
             float(right),
+            float(rear),
         ]
+        self._last_sector_depths = list(msg.data)
         self.sector_depth_pub.publish(msg)
+
+    def overlay_sector_depth_debug(self, image: np.ndarray) -> np.ndarray:
+        """
+        在 YOLO 輸出畫面上標示避障 depth sector 區域與最小深度（公尺）。
+        方便對照 left=0.26m 等數值來自畫面哪一塊。
+        """
+        if self._last_sector_depths is None or len(self._last_sector_depths) < 6:
+            return image
+
+        out = image.copy()
+        h, w = out.shape[:2]
+        y_fwd0 = int(h * 0.35)
+        y_fwd1 = max(y_fwd0 + 1, int(h * 0.55))
+        y_rear0 = y_fwd1
+        y_rear1 = h
+        col_w = max(1, w // 5)
+        bands = [
+            ("left", 0, col_w, (0, 180, 255)),
+            ("front_left", col_w, 2 * col_w, (0, 255, 255)),
+            ("front", 2 * col_w, 3 * col_w, (0, 255, 0)),
+            ("front_right", 3 * col_w, 4 * col_w, (255, 255, 0)),
+            ("right", 4 * col_w, w, (0, 128, 255)),
+        ]
+        depths = self._last_sector_depths
+        labels = [
+            ("front", depths[0]),
+            ("front_left", depths[1]),
+            ("left", depths[2]),
+            ("front_right", depths[3]),
+            ("right", depths[4]),
+            ("rear", depths[5]),
+        ]
+        depth_by_name = {name: val for name, val in labels}
+
+        for name, x0, x1, color in bands:
+            cv2.rectangle(out, (x0, y_fwd0), (x1, y_fwd1), color, 2)
+            val = depth_by_name.get(name, -1.0)
+            txt = f"{name} {val:.2f}m" if val > 0 else f"{name} n/a"
+            cv2.putText(
+                out,
+                txt,
+                (x0 + 4, max(y_fwd0 + 18, 16)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        rear_val = depths[5]
+        cv2.rectangle(out, (0, y_rear0), (w, y_rear1), (180, 80, 255), 2)
+        rear_txt = f"rear {rear_val:.2f}m" if rear_val > 0 else "rear n/a"
+        cv2.putText(
+            out,
+            rear_txt,
+            (8, min(y_rear1 - 8, h - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (180, 80, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            out,
+            "fwd bands: y 35-55% | rear: y 55-100%",
+            (8, y_fwd0 - 6 if y_fwd0 > 20 else 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        return out
 
     def get_depth_at(self, x, y):
         """

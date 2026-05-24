@@ -329,6 +329,7 @@ class Nav2Processing:
         yaw_deadband_px=12.0,
         min_yaw_large_px=100.0,
         pixel_offset_bias_px=0.0,
+        yolo_target_info=None,
     ):
         """
         視覺伺服（近距離）：
@@ -341,10 +342,12 @@ class Nav2Processing:
         dt = max(0.02, min(0.2, now - self._vs_last_time))
         self._vs_last_time = now
 
-        yolo_target_info = self.data_processor.get_yolo_target_info()
+        if yolo_target_info is None:
+            yolo_target_info = self.data_processor.get_yolo_target_info()
         if yolo_target_info is None or len(yolo_target_info) < 3:
-            # 沒資料時先停
-            return [0.0, 0.0, 0.0, 0.0]
+            # 沒資料時改搜尋自轉，避免輸出全零輪速
+            spin = abs(float(search_spin_speed))
+            return [-spin, spin, -spin, spin]
 
         detected = yolo_target_info[0] == 1.0
         depth = float(yolo_target_info[1])
