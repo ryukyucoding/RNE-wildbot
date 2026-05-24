@@ -12,9 +12,16 @@ RIGHT_LIDAR_INDICES = list(range(-45, -15))  # right lidar indices
 # Angle bins for obstacle guard (degrees, 0 = lidar forward)
 LIDAR_FRONT_HALF_ANGLE_DEG = 35.0
 LIDAR_SIDE_MIN_ANGLE_DEG = 38.0
-LIDAR_SIDE_MAX_ANGLE_DEG = 95.0
+LIDAR_SIDE_MAX_ANGLE_DEG = 72.0
+# Scan hits with x < -REAR_AXLE_BEHIND_LIDAR_M (lidar frame) are rear-only, not forward.
+REAR_AXLE_BEHIND_LIDAR_M = 0.22
+LIDAR_REAR_MIN_ANGLE_DEG = 100.0
 LIDAR_MIN_RANGE_M = 0.12
 LIDAR_MAX_RANGE_M = 50.0
+# Close returns must span at least this many degrees to count as a real obstacle.
+LIDAR_CLOSE_OBSTACLE_M = 0.49
+LIDAR_CLOSE_MIN_SPAN_DEG = 4.0
+LIDAR_CLOSE_GAP_TOL_DEG = 2.5
 
 
 class DataProcessor:
@@ -96,49 +103,192 @@ class DataProcessor:
         idx = min(len(trimmed) - 1, max(0, int(len(trimmed) * percentile)))
         return trimmed[idx]
 
+    @staticmethod
+    def _lidar_best_close_run(
+        close_hits: list[tuple[float, float]],
+        gap_tol_deg: float = LIDAR_CLOSE_GAP_TOL_DEG,
+    ) -> tuple[float, list[tuple[float, float]]]:
+        """Longest contiguous run of close hits; span is end_angle - start_angle (deg)."""
+        if not close_hits:
+            return 0.0, []
+        sorted_hits = sorted(close_hits, key=lambda t: t[0])
+        best_span = 0.0
+        best_run: list[tuple[float, float]] = []
+        run = [sorted_hits[0]]
+        for i in range(1, len(sorted_hits)):
+            gap = math.degrees(sorted_hits[i][0] - sorted_hits[i - 1][0])
+            if gap <= gap_tol_deg:
+                run.append(sorted_hits[i])
+            else:
+                span = math.degrees(run[-1][0] - run[0][0])
+                if span > best_span:
+                    best_span = span
+                    best_run = list(run)
+                run = [sorted_hits[i]]
+        span = math.degrees(run[-1][0] - run[0][0])
+        if span > best_span:
+            best_span = span
+            best_run = list(run)
+        return best_span, best_run
+
+    def _lidar_sector_range_from_hits(
+        self,
+        hits: list[tuple[float, float]],
+        close_m: float = LIDAR_CLOSE_OBSTACLE_M,
+        min_span_deg: float = LIDAR_CLOSE_MIN_SPAN_DEG,
+    ) -> tuple[float | None, float]:
+        """
+        Sector range with contiguous-close filter.
+
+        Returns (range_m, close_span_deg). Close returns (< close_m) only count
+        when they span >= min_span_deg; otherwise they are ignored as glancing noise.
+        """
+        if not hits:
+            return None, 0.0
+
+        close_hits = [
+            (a, r)
+            for a, r in hits
+            if LIDAR_MIN_RANGE_M < r < close_m
+        ]
+        far_ranges = [
+            r
+            for _, r in hits
+            if close_m <= r < LIDAR_MAX_RANGE_M
+        ]
+
+        if close_hits:
+            span, run = self._lidar_best_close_run(close_hits)
+            if span >= min_span_deg and run:
+                vals = [r for _, r in run]
+                robust = self._robust_sector_distance(vals)
+                return robust, span
+            if far_ranges:
+                return self._robust_sector_distance(far_ranges), span
+            return None, span
+
+        all_ranges = [r for _, r in hits if LIDAR_MIN_RANGE_M < r < LIDAR_MAX_RANGE_M]
+        if not all_ranges:
+            return None, 0.0
+        return self._robust_sector_distance(all_ranges), 0.0
+
+    def _collect_lidar_forward_hits(self, lidar_msg):
+        angle_min = lidar_msg.angle_min
+        angle_increment = lidar_msg.angle_increment
+        front_half = math.radians(LIDAR_FRONT_HALF_ANGLE_DEG)
+        side_min = math.radians(LIDAR_SIDE_MIN_ANGLE_DEG)
+        side_max = math.radians(LIDAR_SIDE_MAX_ANGLE_DEG)
+        rear_plane = -REAR_AXLE_BEHIND_LIDAR_M
+        front_hits: list[tuple[float, float]] = []
+        left_hits: list[tuple[float, float]] = []
+        right_hits: list[tuple[float, float]] = []
+
+        for i, r in enumerate(lidar_msg.ranges):
+            if not math.isfinite(r):
+                continue
+            if not (LIDAR_MIN_RANGE_M < r < LIDAR_MAX_RANGE_M):
+                continue
+            angle = self._normalize_scan_angle(angle_min + i * angle_increment)
+            if self._lidar_hit_forward_x(angle, r) < rear_plane:
+                continue
+            abs_angle = abs(angle)
+
+            if abs_angle <= front_half:
+                front_hits.append((angle, r))
+            elif side_min <= angle <= side_max:
+                left_hits.append((angle, r))
+            elif -side_max <= angle <= -side_min:
+                right_hits.append((angle, r))
+
+        return front_hits, left_hits, right_hits
+
+    def _lidar_hit_forward_x(self, angle: float, range_m: float) -> float:
+        """Forward component of a scan hit in lidar/base frame (+x = ahead)."""
+        return range_m * math.cos(angle)
+
     def get_lidar_sector_minimums(self):
         """
-        Minimum range (m) per sector from raw /scan using bearing angles.
+        Minimum range (m) per forward sector from raw /scan using bearing angles.
+
+        Hits behind the rear-axle plane (x < -REAR_AXLE_BEHIND_LIDAR_M) are excluded
+        here; they belong in get_lidar_rear_minimum() for backward motion only.
 
         Sectors (angle 0 = lidar forward):
           front : |angle| <= LIDAR_FRONT_HALF_ANGLE_DEG
           left  : +LIDAR_SIDE_MIN..+LIDAR_SIDE_MAX deg
           right : -LIDAR_SIDE_MAX..-LIDAR_SIDE_MIN deg
 
-        Front / side bins are separated to reduce cross-talk near sector borders.
         Returns (front, left, right); each may be None if no valid returns.
         """
         lidar_msg = self.ros_communicator.get_latest_lidar()
         if lidar_msg is None:
             return None, None, None
 
+        front_hits, left_hits, right_hits = self._collect_lidar_forward_hits(lidar_msg)
+        lf, _ = self._lidar_sector_range_from_hits(front_hits)
+        ll, _ = self._lidar_sector_range_from_hits(left_hits)
+        lr, _ = self._lidar_sector_range_from_hits(right_hits)
+        return lf, ll, lr
+
+    def get_lidar_sector_closest_hits(self):
+        """
+        Debug helper: per forward sector, report robust min plus raw closest hit.
+
+        Returns dict with keys front/left/right, each either None or:
+          {robust_m, raw_min_m, raw_min_angle_deg, hit_count}
+        """
+        lidar_msg = self.ros_communicator.get_latest_lidar()
+        if lidar_msg is None:
+            return {"front": None, "left": None, "right": None}
+
+        front_hits, left_hits, right_hits = self._collect_lidar_forward_hits(lidar_msg)
+        buckets = {"front": front_hits, "left": left_hits, "right": right_hits}
+
+        out: dict[str, dict | None] = {}
+        for name, hits in buckets.items():
+            if not hits:
+                out[name] = None
+                continue
+            raw_min_r, raw_min_deg = min(
+                ((r, math.degrees(a)) for a, r in hits),
+                key=lambda t: t[0],
+            )
+            robust, close_span = self._lidar_sector_range_from_hits(hits)
+            out[name] = {
+                "robust_m": robust,
+                "raw_min_m": raw_min_r,
+                "raw_min_angle_deg": raw_min_deg,
+                "hit_count": len(hits),
+                "close_span_deg": close_span,
+            }
+        return out
+
+    def get_lidar_rear_minimum(self):
+        """
+        Minimum range (m) behind the rear-axle plane — for backward motion only.
+
+        Includes LiDAR returns with forward x < -REAR_AXLE_BEHIND_LIDAR_M and
+        rear-arc angles (|angle| >= LIDAR_REAR_MIN_ANGLE_DEG).
+        """
+        lidar_msg = self.ros_communicator.get_latest_lidar()
+        if lidar_msg is None:
+            return None
+
         angle_min = lidar_msg.angle_min
         angle_increment = lidar_msg.angle_increment
-        front_half = math.radians(LIDAR_FRONT_HALF_ANGLE_DEG)
-        side_min = math.radians(LIDAR_SIDE_MIN_ANGLE_DEG)
-        side_max = math.radians(LIDAR_SIDE_MAX_ANGLE_DEG)
-        front_vals: list[float] = []
-        left_vals: list[float] = []
-        right_vals: list[float] = []
+        rear_plane = -REAR_AXLE_BEHIND_LIDAR_M
+        rear_angle = math.radians(LIDAR_REAR_MIN_ANGLE_DEG)
+        rear_vals: list[float] = []
 
         for i, r in enumerate(lidar_msg.ranges):
             if not math.isfinite(r):
                 continue
             angle = self._normalize_scan_angle(angle_min + i * angle_increment)
-            abs_angle = abs(angle)
+            x_fwd = self._lidar_hit_forward_x(angle, r)
+            if x_fwd < rear_plane or abs(angle) >= rear_angle:
+                rear_vals.append(r)
 
-            if abs_angle <= front_half:
-                front_vals.append(r)
-            elif side_min <= angle <= side_max:
-                left_vals.append(r)
-            elif -side_max <= angle <= -side_min:
-                right_vals.append(r)
-
-        return (
-            self._robust_sector_distance(front_vals),
-            self._robust_sector_distance(left_vals),
-            self._robust_sector_distance(right_vals),
-        )
+        return self._robust_sector_distance(rear_vals)
 
     def get_processed_lidar(self):
         lidar_msg = self.ros_communicator.get_latest_lidar()

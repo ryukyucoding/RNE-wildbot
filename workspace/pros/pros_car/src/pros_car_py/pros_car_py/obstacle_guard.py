@@ -8,6 +8,47 @@ from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass
+class ObstacleSourceDebug:
+    """Per-sensor breakdown for obstacle clearance (diagnostics only)."""
+
+    lidar_front: Optional[float] = None
+    lidar_left: Optional[float] = None
+    lidar_right: Optional[float] = None
+    depth_front: Optional[float] = None
+    depth_front_left: Optional[float] = None
+    depth_left: Optional[float] = None
+    depth_front_right: Optional[float] = None
+    depth_right: Optional[float] = None
+    depth_rear: Optional[float] = None
+    depth_left_combined: Optional[float] = None
+    depth_left_filtered: bool = False
+    lidar_left_filtered: bool = False
+    lidar_right_filtered: bool = False
+    left_winner: str = "none"
+    corridor_scale: float = 1.0
+
+    def format_compact(self) -> str:
+        def _m(v: Optional[float]) -> str:
+            return f"{v:.2f}" if v is not None and math.isfinite(v) else "n/a"
+
+        parts = [
+            f"L({_m(self.lidar_left)})",
+            f"Dfl({_m(self.depth_front_left)})",
+            f"Dl({_m(self.depth_left)})",
+            f"Dr({_m(self.depth_right)})",
+            f"→left={self.left_winner}",
+        ]
+        if self.depth_left_filtered:
+            parts.append("depth_left_filtered")
+        if self.lidar_left_filtered:
+            parts.append("lidar_left_filtered")
+        if self.lidar_right_filtered:
+            parts.append("lidar_right_filtered")
+        parts.append(f"corridor={self.corridor_scale:.2f}")
+        return " ".join(parts)
+
+
+@dataclass
 class ObstacleGuardResult:
     min_clearance_m: float
     front_clearance_m: float
@@ -18,6 +59,10 @@ class ObstacleGuardResult:
     sensor_front_m: float = float("inf")
     sensor_left_m: float = float("inf")
     sensor_right_m: float = float("inf")
+    sensor_rear_m: float = float("inf")
+    rear_clearance_m: float = float("inf")
+    backward_speed_scale: float = 1.0
+    source_debug: Optional[ObstacleSourceDebug] = None
 
 
 def _finite_clearance(value: Optional[float], unknown_as_blocked_m: float = 0.0) -> float:
@@ -59,6 +104,7 @@ class ObstacleGuard:
     SECTOR_LEFT = 2
     SECTOR_FRONT_RIGHT = 3
     SECTOR_RIGHT = 4
+    SECTOR_REAR = 5
 
     def __init__(
         self,
@@ -86,7 +132,7 @@ class ObstacleGuard:
     def from_profile(cls, unity: bool) -> "ObstacleGuard":
         if unity:
             return cls(
-                stop_m=0.60,
+                stop_m=0.35,
                 slow_m=1.20,
                 side_stop_m=0.32,
                 depth_min_m=0.40,
@@ -146,6 +192,191 @@ class ObstacleGuard:
             _min_valid(multi_depth[self.DEPTH_RIGHT_SLICE], self._depth_valid),
         )
 
+    @staticmethod
+    def _diagonal_depth_mins(
+        sector_depth: Optional[List[float]],
+        depth_valid_fn,
+    ) -> tuple[Optional[float], Optional[float]]:
+        if not sector_depth or len(sector_depth) < 5:
+            return None, None
+        fl = sector_depth[ObstacleGuard.SECTOR_FRONT_LEFT]
+        fr = sector_depth[ObstacleGuard.SECTOR_FRONT_RIGHT]
+        out_l = fl if depth_valid_fn(fl) else None
+        out_r = fr if depth_valid_fn(fr) else None
+        return out_l, out_r
+
+    @staticmethod
+    def _pick_open_side_rotation(
+        left_eff: float,
+        right_eff: float,
+        side_bias: float,
+        side_asym: float,
+    ) -> Optional[str]:
+        if left_eff + side_bias < right_eff and side_asym >= side_bias:
+            return "CLOCKWISE_ROTATION"
+        if right_eff + side_bias < left_eff and side_asym >= side_bias:
+            return "COUNTERCLOCKWISE_ROTATION"
+        if left_eff >= right_eff + 0.04:
+            return "CLOCKWISE_ROTATION"
+        if right_eff >= left_eff + 0.04:
+            return "COUNTERCLOCKWISE_ROTATION"
+        return None
+
+    def must_override_visual_yaw(self, result: ObstacleGuardResult) -> bool:
+        """True when visual-servo yaw must not suppress obstacle escape."""
+        sf = result.sensor_front_m
+        if math.isfinite(sf) and sf < self.stop_m + 0.05:
+            return True
+        if result.block_cmd in ("CLOCKWISE_ROTATION", "COUNTERCLOCKWISE_ROTATION"):
+            if result.speed_scale <= 0.40:
+                return True
+        if result.block_cmd == "STOP" and result.speed_scale <= 0.05:
+            return True
+        return False
+
+    def _escape_yaw_wheel(self, block_cmd: Optional[str], approach_mode: bool) -> float:
+        mag = 95.0 if approach_mode else 130.0
+        if block_cmd == "CLOCKWISE_ROTATION":
+            return mag
+        if block_cmd == "COUNTERCLOCKWISE_ROTATION":
+            return -mag
+        return 0.0
+
+    def _depth_only_floor_false_positive(
+        self,
+        sensor_front: Optional[float],
+        sensor_left: Optional[float],
+        sensor_right: Optional[float],
+        lidar_available: bool,
+        approach_target_depth_m: Optional[float],
+        approach_mode: bool,
+    ) -> bool:
+        """
+        Without LiDAR, sector depth bands (lower 65% of image) often read floor
+        at ~0.45–0.55 m on all sides — not real walls.
+        """
+        if not approach_mode or lidar_available:
+            return False
+        vals = [
+            v
+            for v in (sensor_front, sensor_left, sensor_right)
+            if v is not None and math.isfinite(v)
+        ]
+        if len(vals) < 2:
+            return False
+        vmin, vmax = min(vals), max(vals)
+        if vmax - vmin > 0.15:
+            return False
+        if (
+            approach_target_depth_m is not None
+            and approach_target_depth_m > vmin + 0.25
+            and vmin < self.stop_m + 0.15
+        ):
+            return True
+        if vmax - vmin < 0.10 and vmin < self.stop_m + 0.05:
+            return True
+        return False
+
+    @staticmethod
+    def _depth_side_likely_rear_body(
+        depth_side_m: Optional[float],
+        approach_target_depth_m: Optional[float],
+        approach_mode: bool,
+    ) -> bool:
+        """Depth side hit much closer than YOLO target → often ground near rear wheels."""
+        if not approach_mode or depth_side_m is None or not math.isfinite(depth_side_m):
+            return False
+        if approach_target_depth_m is None or approach_target_depth_m <= 0.0:
+            return False
+        return (
+            depth_side_m < 0.55
+            and approach_target_depth_m > depth_side_m + 0.35
+        )
+
+    @staticmethod
+    def _lidar_side_depth_disagreement(
+        lidar_side_m: Optional[float],
+        depth_side_m: Optional[float],
+        approach_target_depth_m: Optional[float],
+        approach_mode: bool,
+    ) -> bool:
+        """
+        LiDAR side glancing hit (e.g. 38° ground/body) while depth/YOLO see open space.
+        """
+        if not approach_mode:
+            return False
+        if lidar_side_m is None or depth_side_m is None:
+            return False
+        if not (math.isfinite(lidar_side_m) and math.isfinite(depth_side_m)):
+            return False
+        if lidar_side_m >= 0.55 or depth_side_m < 0.50:
+            return False
+        if depth_side_m <= lidar_side_m + 0.20:
+            return False
+        if (
+            approach_target_depth_m is not None
+            and approach_target_depth_m > 0.0
+            and approach_target_depth_m <= lidar_side_m + 0.25
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _approach_side_open_by_depth(
+        lidar_side_m: Optional[float],
+        depth_side_m: Optional[float],
+        approach_target_depth_m: Optional[float],
+        approach_mode: bool,
+    ) -> bool:
+        """Approach: depth says side is open while LiDAR reads a near ground ring."""
+        if not approach_mode or depth_side_m is None or not math.isfinite(depth_side_m):
+            return False
+        if lidar_side_m is None or not math.isfinite(lidar_side_m):
+            return False
+        if lidar_side_m >= 0.55 or depth_side_m < 0.50:
+            return False
+        if depth_side_m <= lidar_side_m + 0.18:
+            return False
+        if (
+            approach_target_depth_m is not None
+            and approach_target_depth_m > 0.0
+            and approach_target_depth_m <= lidar_side_m + 0.25
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _side_eff_clearance(
+        sensor_side: Optional[float],
+        approach_mode: bool,
+    ) -> float:
+        if sensor_side is not None and math.isfinite(sensor_side):
+            return float(sensor_side)
+        return float("inf") if approach_mode else 0.0
+
+    def _rear_clearance_from_sensors(
+        self,
+        lidar_rear: Optional[float],
+        depth_rear: Optional[float],
+    ) -> tuple[Optional[float], float]:
+        vals: list[float] = []
+        if lidar_rear is not None and self._lidar_valid(lidar_rear):
+            vals.append(lidar_rear)
+        if depth_rear is not None and self._depth_valid(depth_rear):
+            vals.append(depth_rear)
+        if not vals:
+            return None, 1.0
+        rear_m = min(vals)
+        if rear_m < self.stop_m:
+            return rear_m, 0.0
+        if rear_m < self.slow_m:
+            scale = max(
+                0.0,
+                min(1.0, (rear_m - self.stop_m) / (self.slow_m - self.stop_m)),
+            )
+            return rear_m, scale
+        return rear_m, 1.0
+
     def evaluate(
         self,
         lidar_sectors: Optional[
@@ -156,10 +387,52 @@ class ObstacleGuard:
         lidar_flat: Optional[List[float]] = None,
         approach_target_depth_m: Optional[float] = None,
         approach_mode: bool = False,
+        speed_scale_floor: Optional[float] = None,
+        lidar_rear_m: Optional[float] = None,
     ) -> ObstacleGuardResult:
         del lidar_flat  # legacy arg, unused
         lf, ll, lr = self._lidar_sector_mins_from_tuple(lidar_sectors)
+        ll_raw = ll
+        lr_raw = lr
+        lidar_left_filtered = False
+        lidar_right_filtered = False
         df, dl, dr = self._depth_sector_mins(multi_depth, sector_depth)
+        dl_before_filter = dl
+        dr_before_filter = dr
+        depth_left_filtered = False
+        diag_left, diag_right = self._diagonal_depth_mins(sector_depth, self._depth_valid)
+
+        depth_front_raw: Optional[float] = None
+        depth_front_left_raw: Optional[float] = None
+        depth_left_raw: Optional[float] = None
+        depth_front_right_raw: Optional[float] = None
+        depth_right_raw: Optional[float] = None
+        depth_rear_raw: Optional[float] = None
+        if sector_depth and len(sector_depth) >= 5:
+            if self._depth_valid(sector_depth[self.SECTOR_FRONT]):
+                depth_front_raw = sector_depth[self.SECTOR_FRONT]
+            if self._depth_valid(sector_depth[self.SECTOR_FRONT_LEFT]):
+                depth_front_left_raw = sector_depth[self.SECTOR_FRONT_LEFT]
+            if self._depth_valid(sector_depth[self.SECTOR_LEFT]):
+                depth_left_raw = sector_depth[self.SECTOR_LEFT]
+            if self._depth_valid(sector_depth[self.SECTOR_FRONT_RIGHT]):
+                depth_front_right_raw = sector_depth[self.SECTOR_FRONT_RIGHT]
+            if self._depth_valid(sector_depth[self.SECTOR_RIGHT]):
+                depth_right_raw = sector_depth[self.SECTOR_RIGHT]
+        if sector_depth and len(sector_depth) >= 6:
+            dr_val = sector_depth[self.SECTOR_REAR]
+            if self._depth_valid(dr_val):
+                depth_rear_raw = dr_val
+
+        if approach_mode and self._depth_side_likely_rear_body(
+            dl, approach_target_depth_m, approach_mode
+        ):
+            depth_left_filtered = True
+            dl = None
+        if approach_mode and self._depth_side_likely_rear_body(
+            dr, approach_target_depth_m, approach_mode
+        ):
+            dr = None
 
         def fuse(a: Optional[float], b: Optional[float]) -> Optional[float]:
             vals = [
@@ -169,26 +442,72 @@ class ObstacleGuard:
             ]
             return min(vals) if vals else None
 
-        def fuse_side(lidar_v: Optional[float], depth_v: Optional[float]) -> Optional[float]:
-            """Side clearance: prefer LiDAR (walls); depth often misreads floor/body."""
-            if lidar_v is not None and self._lidar_valid(lidar_v):
-                return lidar_v
-            if depth_v is not None and self._depth_valid(depth_v):
+        def fuse_front(lidar_v: Optional[float], depth_v: Optional[float]) -> Optional[float]:
+            if (
+                approach_mode
+                and self._lidar_side_depth_disagreement(
+                    lidar_v, depth_v, approach_target_depth_m, approach_mode
+                )
+            ):
                 return depth_v
-            return None
+            return fuse(lidar_v, depth_v)
 
-        sensor_front = fuse(lf, df)
+        def fuse_side(lidar_v: Optional[float], depth_v: Optional[float]) -> Optional[float]:
+            """Side clearance: in approach, trust depth when LiDAR reads a ground ring."""
+            if approach_mode and self._approach_side_open_by_depth(
+                lidar_v, depth_v, approach_target_depth_m, approach_mode
+            ):
+                return depth_v
+            use_lidar = lidar_v
+            if approach_mode and self._lidar_side_depth_disagreement(
+                lidar_v, depth_v, approach_target_depth_m, approach_mode
+            ):
+                use_lidar = None
+            vals: list[float] = []
+            if use_lidar is not None and self._lidar_valid(use_lidar):
+                vals.append(use_lidar)
+            if depth_v is not None and self._depth_valid(depth_v):
+                vals.append(depth_v)
+            if not vals:
+                return None
+            if approach_mode:
+                return min(vals)
+            if use_lidar is not None and self._lidar_valid(use_lidar):
+                return use_lidar
+            return depth_v
+
+        sensor_front = fuse_front(lf, df)
         sensor_left = fuse_side(ll, dl)
         sensor_right = fuse_side(lr, dr)
 
+        if (
+            approach_mode
+            and ll_raw is not None
+            and sensor_left is not None
+            and dl is not None
+            and abs(sensor_left - dl) < 0.08
+            and ll_raw < dl - 0.20
+        ):
+            lidar_left_filtered = True
+        if (
+            approach_mode
+            and lr_raw is not None
+            and sensor_right is not None
+            and dr is not None
+            and abs(sensor_right - dr) < 0.08
+            and lr_raw < dr - 0.20
+        ):
+            lidar_right_filtered = True
+
         front_eff = _finite_clearance(sensor_front)
-        left_eff = _finite_clearance(sensor_left)
-        right_eff = _finite_clearance(sensor_right)
+        left_eff = self._side_eff_clearance(sensor_left, approach_mode)
+        right_eff = self._side_eff_clearance(sensor_right, approach_mode)
 
         # 接近熊時可抬高「顯示用 front」，但牆壁安全判斷仍用 sensor 原始值
         front = front_eff
         if (
-            approach_target_depth_m is not None
+            approach_mode
+            and approach_target_depth_m is not None
             and approach_target_depth_m > self.stop_m
             and sensor_front is not None
             and sensor_front > self.stop_m
@@ -207,6 +526,17 @@ class ObstacleGuard:
 
         side_asym = abs(left_eff - right_eff)
         side_bias = max(self.side_clearance_bias_m, self.side_block_min_asymmetry_m)
+        diag_thresh = self.side_stop_m + (0.10 if approach_mode else 0.06)
+
+        lidar_available = any(x is not None for x in (lf, ll, lr))
+        depth_floor_fp = self._depth_only_floor_false_positive(
+            sensor_front,
+            sensor_left,
+            sensor_right,
+            lidar_available,
+            approach_target_depth_m,
+            approach_mode,
+        )
 
         # 安全停車：用 sensor 原始距離，避免把牆/窄通道當成可前進
         hard_front_block = sensor_front is not None and sensor_front < self.stop_m
@@ -216,14 +546,18 @@ class ObstacleGuard:
             and sensor_front < self.slow_m
         )
 
+        if depth_floor_fp:
+            hard_front_block = False
+            hard_side_block = False
+
         if hard_front_block:
             speed_scale = 0.0
             block_cmd = "STOP"
-            if not approach_mode:
-                if left_eff + side_bias < right_eff and side_asym >= side_bias:
-                    block_cmd = "CLOCKWISE_ROTATION"
-                elif right_eff + side_bias < left_eff and side_asym >= side_bias:
-                    block_cmd = "COUNTERCLOCKWISE_ROTATION"
+            escape = self._pick_open_side_rotation(
+                left_eff, right_eff, side_bias, side_asym
+            )
+            if escape is not None:
+                block_cmd = escape
         elif sensor_front is not None and sensor_front < self.slow_m:
             speed_scale = max(
                 0.0,
@@ -235,24 +569,109 @@ class ObstacleGuard:
         elif hard_side_block:
             speed_scale = min(speed_scale, 0.15)
             block_cmd = "STOP"
-        elif not approach_mode and (
+        elif (
             left_eff < self.side_stop_m
             and right_eff >= left_eff + side_bias
             and side_asym >= side_bias
             and sensor_front is not None
             and sensor_front >= self.stop_m
+            and not (
+                approach_mode
+                and approach_target_depth_m is not None
+                and approach_target_depth_m > left_eff + 0.75
+            )
         ):
-            speed_scale = min(speed_scale, 0.5)
+            speed_scale = min(speed_scale, 0.5 if approach_mode else 0.5)
             block_cmd = "CLOCKWISE_ROTATION"
-        elif not approach_mode and (
+        elif (
             right_eff < self.side_stop_m
             and left_eff >= right_eff + side_bias
             and side_asym >= side_bias
             and sensor_front is not None
             and sensor_front >= self.stop_m
+            and not (
+                approach_mode
+                and approach_target_depth_m is not None
+                and approach_target_depth_m > right_eff + 0.75
+            )
         ):
-            speed_scale = min(speed_scale, 0.5)
+            speed_scale = min(speed_scale, 0.5 if approach_mode else 0.5)
             block_cmd = "COUNTERCLOCKWISE_ROTATION"
+
+        # 對角深度（front_left / front_right）：補 LiDAR 掃不到的矮障礙（Unity 橋等）
+        if (
+            block_cmd is None
+            and not depth_floor_fp
+            and sensor_front is not None
+            and sensor_front >= self.stop_m
+        ):
+            if (
+                diag_left is not None
+                and diag_left < diag_thresh
+                and (diag_right is None or diag_left + 0.05 < diag_right)
+            ):
+                speed_scale = min(speed_scale, 0.45 if approach_mode else 0.35)
+                block_cmd = "CLOCKWISE_ROTATION"
+            elif (
+                diag_right is not None
+                and diag_right < diag_thresh
+                and (diag_left is None or diag_right + 0.05 < diag_left)
+            ):
+                speed_scale = min(speed_scale, 0.45 if approach_mode else 0.35)
+                block_cmd = "COUNTERCLOCKWISE_ROTATION"
+
+        if (
+            approach_mode
+            and speed_scale_floor is not None
+            and speed_scale_floor > 0.0
+            and not hard_front_block
+        ):
+            speed_scale = max(speed_scale, min(1.0, float(speed_scale_floor)))
+
+        sensor_rear, backward_speed_scale = self._rear_clearance_from_sensors(
+            lidar_rear_m,
+            depth_rear_raw,
+        )
+
+        left_winner = "none"
+        if sensor_left is not None:
+            lidar_ok = ll is not None and self._lidar_valid(ll)
+            depth_ok = dl is not None and self._depth_valid(dl)
+            if lidar_ok and depth_ok:
+                left_winner = (
+                    "lidar"
+                    if ll <= dl + 1e-4
+                    else "depth"
+                )
+            elif lidar_ok:
+                left_winner = "lidar"
+            elif depth_ok:
+                left_winner = "depth"
+
+        corridor_scale = self._corridor_forward_scale(
+            _finite_clearance(sensor_front, float("inf")),
+            _finite_clearance(sensor_left, float("inf")),
+            _finite_clearance(sensor_right, float("inf")),
+            approach_mode=approach_mode,
+        )
+
+        source_debug = ObstacleSourceDebug(
+            lidar_front=lf,
+            lidar_left=ll,
+            lidar_right=lr,
+            depth_front=depth_front_raw if depth_front_raw is not None else df,
+            depth_front_left=depth_front_left_raw,
+            depth_left=depth_left_raw,
+            depth_front_right=depth_front_right_raw,
+            depth_right=depth_right_raw if depth_right_raw is not None else dr,
+            depth_rear=depth_rear_raw,
+            depth_left_combined=dl_before_filter,
+            depth_left_filtered=depth_left_filtered,
+            lidar_left_filtered=lidar_left_filtered,
+            lidar_right_filtered=lidar_right_filtered,
+            left_winner=left_winner,
+            corridor_scale=corridor_scale,
+        )
 
         return ObstacleGuardResult(
             min_clearance_m=min_clearance,
@@ -264,6 +683,10 @@ class ObstacleGuard:
             sensor_front_m=_finite_clearance(sensor_front, float("inf")),
             sensor_left_m=_finite_clearance(sensor_left, float("inf")),
             sensor_right_m=_finite_clearance(sensor_right, float("inf")),
+            sensor_rear_m=_finite_clearance(sensor_rear, float("inf")),
+            rear_clearance_m=_finite_clearance(sensor_rear, float("inf")),
+            backward_speed_scale=backward_speed_scale,
+            source_debug=source_debug,
         )
 
     def _corridor_forward_scale(
@@ -280,9 +703,15 @@ class ObstacleGuard:
         if math.isfinite(front_c) and front_c < self.stop_m + 0.04:
             return 0.0
 
+        if not math.isfinite(left_c):
+            left_c = float("inf")
+        if not math.isfinite(right_c):
+            right_c = float("inf")
         side_min = min(left_c, right_c)
         # Unknown side (0 from missing data) — do not hard-block in approach
         if side_min <= 1e-6 and approach_mode:
+            return 1.0
+        if not math.isfinite(side_min):
             return 1.0
 
         tight = self.side_stop_m + (0.14 if approach_mode else 0.08)
@@ -295,21 +724,44 @@ class ObstacleGuard:
         return max(0.35 if approach_mode else 0.20, min(1.0, ratio))
 
     def apply_to_wheel_cmd(
-        self, wheel_cmd: List[float], result: ObstacleGuardResult,
+        self,
+        wheel_cmd: List[float],
+        result: ObstacleGuardResult,
         approach_mode: bool = False,
+        prefer_visual_yaw: bool = False,
     ) -> List[float]:
-        """Scale forward component; damp yaw toward blocked sides."""
+        """Scale forward component; damp or blend yaw toward open side."""
         left_w, right_w = float(wheel_cmd[0]), float(wheel_cmd[1])
         fwd = 0.5 * (left_w + right_w)
         yaw = 0.5 * (left_w - right_w)
 
-        left_c = _finite_clearance(result.sensor_left_m, float("inf"))
-        right_c = _finite_clearance(result.sensor_right_m, float("inf"))
+        left_c = result.left_clearance_m
+        right_c = result.right_clearance_m
         front_c = _finite_clearance(result.sensor_front_m, float("inf"))
-        if not math.isfinite(left_c):
-            left_c = result.left_clearance_m
-        if not math.isfinite(right_c):
-            right_c = result.right_clearance_m
+        if not approach_mode:
+            left_c = _finite_clearance(result.sensor_left_m, float("inf"))
+            right_c = _finite_clearance(result.sensor_right_m, float("inf"))
+            if not math.isfinite(left_c):
+                left_c = result.left_clearance_m
+            if not math.isfinite(right_c):
+                right_c = result.right_clearance_m
+
+        escape_yaw = self._escape_yaw_wheel(result.block_cmd, approach_mode)
+        override_visual = self.must_override_visual_yaw(result)
+
+        if escape_yaw != 0.0:
+            if prefer_visual_yaw and not override_visual:
+                blend = max(0.35, min(0.75, 1.0 - result.speed_scale))
+                yaw = (1.0 - blend) * yaw + blend * escape_yaw
+            else:
+                if result.speed_scale <= 0.10:
+                    fwd = 0.0
+                else:
+                    fwd *= result.speed_scale
+                if abs(yaw) < abs(escape_yaw) * 0.45:
+                    yaw = escape_yaw
+                else:
+                    yaw = 0.55 * escape_yaw + 0.45 * yaw
 
         # 不要往窄側轉（yaw>0 = 右轉，yaw<0 = 左轉）
         if yaw > 0.0 and math.isfinite(right_c) and right_c < self.side_stop_m + 0.10:
@@ -318,7 +770,8 @@ class ObstacleGuard:
             yaw *= max(0.0, left_c / max(self.side_stop_m + 0.10, 1e-3))
 
         if fwd > 0.0:
-            fwd *= result.speed_scale
+            if escape_yaw == 0.0 or (prefer_visual_yaw and not override_visual):
+                fwd *= result.speed_scale
             corridor_scale = self._corridor_forward_scale(
                 front_c if math.isfinite(front_c) else result.front_clearance_m,
                 left_c if math.isfinite(left_c) else self.side_stop_m,
@@ -326,6 +779,11 @@ class ObstacleGuard:
                 approach_mode=approach_mode,
             )
             fwd *= corridor_scale
+        elif fwd < 0.0:
+            bscale = max(0.0, min(1.0, float(result.backward_speed_scale)))
+            fwd *= bscale
+            if bscale <= 0.05:
+                fwd = 0.0
 
         wheel_lim = 480.0
         scaled_left = max(-wheel_lim, min(wheel_lim, fwd + yaw))
@@ -339,3 +797,11 @@ def get_lidar_sector_minimums(data_processor):
         return data_processor.get_lidar_sector_minimums()
     except (AttributeError, TypeError, IndexError):
         return None, None, None
+
+
+def get_lidar_rear_minimum(data_processor):
+    """Return rear minimum range (m) behind rear-axle plane, or None."""
+    try:
+        return data_processor.get_lidar_rear_minimum()
+    except (AttributeError, TypeError, IndexError):
+        return None

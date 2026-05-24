@@ -6,6 +6,7 @@ from nav_msgs.msg import Path
 from sensor_msgs.msg import LaserScan, Imu, CompressedImage
 from trajectory_msgs.msg import JointTrajectoryPoint
 import orjson
+import time
 from pros_car_py.ros_communicator_config import ACTION_MAPPINGS
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import String, Bool
@@ -57,6 +58,7 @@ class RosCommunicator(Node):
 
         # subscribe lidar
         self.latest_lidar = None
+        self._lidar_missing_warn_time = 0.0
         self.subscriber_lidar = self.create_subscription(
             LaserScan, "/scan", self.subscriber_lidar_callback, 1
         )
@@ -302,7 +304,13 @@ class RosCommunicator(Node):
 
     def get_latest_lidar(self):
         if self.latest_lidar is None:
-            self.get_logger().warn("No Lidar data received yet.")
+            now = time.monotonic()
+            if now - self._lidar_missing_warn_time >= 5.0:
+                self._lidar_missing_warn_time = now
+                self.get_logger().warn(
+                    "No LiDAR on /scan yet — check localization stack, "
+                    "ROS_DOMAIN_ID, and Docker bridge."
+                )
         return self.latest_lidar
 
     # received_global_plan callback and get_latest_received_global_plan
