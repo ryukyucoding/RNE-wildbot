@@ -4,7 +4,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped, Point
 from std_msgs.msg import String, Header
 from nav_msgs.msg import Path
 from sensor_msgs.msg import LaserScan, Imu, CompressedImage
-from trajectory_msgs.msg import JointTrajectoryPoint
+from trajectory_msgs.msg import JointTrajectoryPoint, JointTrajectory
 import orjson
 from pros_car_py.ros_communicator_config import ACTION_MAPPINGS
 from geometry_msgs.msg import PointStamped
@@ -15,7 +15,7 @@ from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TwistStamped
 from cv_bridge import CvBridge
 
 
@@ -113,6 +113,16 @@ class RosCommunicator(Node):
         # publish robot arm angle
         self.publisher_joint_trajectory = self.create_publisher(
             JointTrajectoryPoint, DeviceDataTypeEnum.robot_arm, 10
+        )
+
+        # publish real physical robot arm trajectory
+        self.publisher_real_arm = self.create_publisher(
+            JointTrajectory, "/arm_controller/joint_trajectory", 10
+        )
+
+        # publish real physical car cmd_vel
+        self.publisher_cmd_vel = self.create_publisher(
+            TwistStamped, "/base_controller/cmd_vel", 10
         )
 
         self.publisher_coordinates = self.create_publisher(
@@ -324,6 +334,37 @@ class RosCommunicator(Node):
         msg.data = [self._vel3, self._vel4]
         if publish_front == True:
             self.publisher_forward.publish(msg)
+
+    def publish_cmd_vel(self, linear_x, angular_z):
+        """
+        發布實體車使用的 TwistStamped 指令到 /base_controller/cmd_vel
+        """
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.twist.linear.x = float(linear_x)
+        msg.twist.angular.z = float(angular_z)
+        self.publisher_cmd_vel.publish(msg)
+
+    def publish_real_arm_trajectory(self, arm_1_deg, arm_2_deg, gripper_deg):
+        """
+        發布實體車使用的 JointTrajectory 指令到 /arm_controller/joint_trajectory
+        """
+        import math
+        msg = JointTrajectory()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = ""
+        msg.joint_names = ['arm_1_joint', 'arm_2_joint', 'gripper_joint']
+        
+        point = JointTrajectoryPoint()
+        point.positions = [
+            math.radians(arm_1_deg),
+            math.radians(arm_2_deg),
+            math.radians(gripper_deg)
+        ]
+        point.time_from_start.sec = 1
+        msg.points = [point]
+        self.publisher_real_arm.publish(msg)
 
     # publish goal_pose
     def publish_goal_pose(self, goal):

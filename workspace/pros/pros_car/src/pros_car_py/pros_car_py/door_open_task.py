@@ -43,13 +43,14 @@ YOLO_TARGET_LABEL = "knob"
 SEARCH_MAX_ITER = 600             # 600 * 0.1s = 60 秒
 
 # ── Visual Servoing (PID) 參數 ────────────────────────────────────────────────
-# 基礎前進速度（rad/s，對應輪胎轉速）
+# ── Visual Servoing (PID) 參數 ────────────────────────────────────────────────
+# 基礎前進速度（m/s，實體車限制 linear.x 最大 0.546）
 # 為了讓車子有足夠時間把門把置中，降低前進速度
-VS_BASE_SPEED = 60.0
-# 轉向 PID 控制器參數：根據 pixel_offset 計算左右輪速差
-VS_KP_STEER = 1.5           # 提高比例係數，讓車子更積極轉向對齊
-VS_MAX_STEER = 250.0        # 最大轉速差限制（加大以對抗物理引擎摩擦力）
-VS_MIN_STEER = 120.0        # 最小轉速差限制（克服原地旋轉時的靜摩擦力死區）
+VS_BASE_SPEED = 0.15
+# 轉向 PID 控制器參數：根據 pixel_offset 計算角速度
+VS_KP_STEER = 0.01          # 比例係數，需依現場測試微調
+VS_MAX_STEER = 0.5          # 最大轉向角速度（實體車限制 angular.z 最大 3.983）
+VS_MIN_STEER = 0.1          # 最小轉向角速度（克服原地旋轉時的靜摩擦力死區）
 
 # ── 相機/手臂左右中心偏差補償 (像素) ───────────────────────────────────────────
 # 如果當車子停在門前時，門把總是偏向手臂的右側，代表車子應該要再往右偏一些來對準。
@@ -68,7 +69,7 @@ VS_STOP_DISTANCE = 0.30     # 0.30m 停車 (離門把更安全且剛好夠得到
 # 車子到達停車距離後，會先原地旋轉直到門把在畫面中心（誤差 < 容差），才進入手臂動作。
 # 這樣不管從哪個角度靠近，都能確保手臂正對門把。
 VS_ALIGN_PIXEL_TOL = 20.0    # 允許的像素誤差（±20px 內視為對齊）
-VS_ALIGN_KP = 0.6            # 精對齊時的純旋轉 PID 比例係數（加大以確保能推動車子）
+VS_ALIGN_KP = 0.02           # 精對齊時的純旋轉 PID 比例係數（需現場測試微調）
 VS_ALIGN_TIMEOUT = 5.0       # 精對齊最長等待時間（秒），超時則直接進入手臂動作
 
 # 深度 EMA 平滑係數（0~1，越小越平滑，越大越即時）
@@ -160,7 +161,7 @@ class DoorOpenTask:
         # 時間戳記型的丟失追蹤
         self._vs_lost_since = None
         self._fine_align_since = None     # State 2 精對齊階段的開始時間戳記
-        self._last_vs_velocities = [0.0, 0.0, 0.0, 0.0]  # [RL, RR, FL, FR]
+        self._last_vs_velocities = [0.0, 0.0]  # [linear_x, angular_z]
 
     # ──────────────────────────────────────────────────────────────────────────
     # 主要介面
@@ -190,7 +191,7 @@ class DoorOpenTask:
             return True
         elif self.state == DoorOpenState.ERROR:
             print("[DoorOpenTask] 任務失敗，停止車子。")
-            self.car.update_action("STOP")
+            self.rc.publish_cmd_vel(0.0, 0.0)
             return True
         return False
 
@@ -206,9 +207,8 @@ class DoorOpenTask:
         # 為了避免 ROS 2 node 剛啟動時 publisher 遺失第一個封包，我們連發幾次
         print("[DoorOpenTask] 手臂舉到最高，準備執行任務…")
         try:
-            self.arm.joint_angles = [-180.0, 0.0, 90.0]
             for _ in range(5):
-                self.arm._clamp_and_publish()
+                self.rc.publish_real_arm_trajectory(90.0, 90.0, 240.0)
                 time.sleep(0.2)
         except Exception as e:
             print(f"[DoorOpenTask] 手臂初始化警告（忽略）: {e}")
@@ -240,7 +240,7 @@ class DoorOpenTask:
                 self.car._stop_event.set()
                 self.car._auto_nav_thread.join(timeout=2.0)
                 self.car._thread_running = False
-            self.car.update_action("STOP")
+            self.rc.publish_cmd_vel(0.0, 0.0)
             self._transition(DoorOpenState.SEARCH_HANDLE)
         return False
 
@@ -307,12 +307,12 @@ class DoorOpenTask:
         if yolo is not None and yolo[0] == 1:
             # 偵測到目標
             print("[State 1] 偵測到門把！")
-            self.car.update_action("STOP")
+            self.rc.publish_cmd_vel(0.0, 0.0)
             self._transition(DoorOpenState.VISUAL_SERVO_APPROACH)
             return False
 
         # 緩慢順時針旋轉搜尋
-        self.car.update_action("CLOCKWISE_ROTATION_SLOW")
+        self.rc.publish_cmd_vel(0.0, -0.5)
         self._iter += 1
 
         if self._iter > SEARCH_MAX_ITER:
@@ -347,7 +347,7 @@ class DoorOpenTask:
     def _state_visual_servo_approach(self):
         if self._iter == 0:
             print(f"[State 2] 開始 Visual Servoing 靠近門把… 目標距離={VS_STOP_DISTANCE}m")
-            self._last_vs_velocities = [0.0, 0.0, 0.0, 0.0]
+            self._last_vs_velocities = [0.0, 0.0]
             self._vs_lost_since = None
             self._fine_align_since = None   # 精對齊開始時間（None = 尚在靠近階段）
 
@@ -361,12 +361,12 @@ class DoorOpenTask:
                 print(f"[State 2] YOLO 暫時丟失，維持當前速度中 ({VS_PATIENCE_SECS}s 耐心)")
             lost_dur = time.time() - self._vs_lost_since
             if lost_dur < VS_PATIENCE_SECS:
-                self.rc.publish_raw_car_control(self._last_vs_velocities)
+                self.rc.publish_cmd_vel(self._last_vs_velocities[0], self._last_vs_velocities[1])
                 self._iter += 1
                 return False
             print(f"[State 2] 目標持續丟失超過 {VS_PATIENCE_SECS}s，退回搜尋狀態")
             self._vs_lost_since = None
-            self.car.update_action("STOP")
+            self.rc.publish_cmd_vel(0.0, 0.0)
             self._transition(DoorOpenState.SEARCH_HANDLE)
             return False
 
@@ -396,12 +396,12 @@ class DoorOpenTask:
             align_elapsed = time.time() - self._fine_align_since
             if abs(error) <= VS_ALIGN_PIXEL_TOL:
                 print(f"[State 2] ✅ 精對齊完成！最終誤差={error:.1f}px，進入手臂動作")
-                self.car.update_action("STOP")
+                self.rc.publish_cmd_vel(0.0, 0.0)
                 self._transition(DoorOpenState.ARM_AIM)
                 return False
             if align_elapsed > VS_ALIGN_TIMEOUT:
                 print(f"[State 2] ⚠️ 精對齊逾時 ({VS_ALIGN_TIMEOUT}s)，最終誤差={error:.1f}px，強制進入手臂動作")
-                self.car.update_action("STOP")
+                self.rc.publish_cmd_vel(0.0, 0.0)
                 self._transition(DoorOpenState.ARM_AIM)
                 return False
 
@@ -411,14 +411,11 @@ class DoorOpenTask:
                 rotate_output = VS_MIN_STEER if rotate_output > 0 else -VS_MIN_STEER
             rotate_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, rotate_output))
             
-            v_left  =  rotate_output
-            v_right = -rotate_output
-            velocities = [v_left, v_right, v_left, v_right]
-            self.rc.publish_raw_car_control(velocities)
-            self._last_vs_velocities = velocities
+            self.rc.publish_cmd_vel(0.0, -rotate_output)
+            self._last_vs_velocities = [0.0, -rotate_output]
 
             if self._iter % 10 == 0:
-                print(f"[Align] 誤差={error:.1f}px, 原地旋轉 L={v_left:.0f}, R={v_right:.0f} ({align_elapsed:.1f}s)")
+                print(f"[Align] 誤差={error:.1f}px, 原地旋轉 angular_z={-rotate_output:.2f} ({align_elapsed:.1f}s)")
             self._iter += 1
             return False
 
@@ -430,15 +427,12 @@ class DoorOpenTask:
             steer_output = VS_MIN_STEER if steer_output > 0 else -VS_MIN_STEER
         steer_output = max(-VS_MAX_STEER, min(VS_MAX_STEER, steer_output))
 
-        v_left  = VS_BASE_SPEED + steer_output
-        v_right = VS_BASE_SPEED - steer_output
-
-        velocities = [v_left, v_right, v_left, v_right]
-        self.rc.publish_raw_car_control(velocities)
-        self._last_vs_velocities = velocities
+        angular_z = -steer_output
+        self.rc.publish_cmd_vel(VS_BASE_SPEED, angular_z)
+        self._last_vs_velocities = [VS_BASE_SPEED, angular_z]
 
         if self._iter % 20 == 0:
-            print(f"[VS] offset={pixel_offset:.1f}px (target={VS_TARGET_PIXEL_OFFSET:.1f}), steer={steer_output:.1f}, L={v_left:.0f}, R={v_right:.0f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
+            print(f"[VS] offset={pixel_offset:.1f}px (target={VS_TARGET_PIXEL_OFFSET:.1f}), steer={steer_output:.2f}, x={VS_BASE_SPEED:.2f}, z={angular_z:.2f} | LiDAR={lidar_dist if lidar_dist else 0:.2f}m")
 
         self._iter += 1
         return False
@@ -450,42 +444,16 @@ class DoorOpenTask:
 
     def _state_arm_aim(self):
         if self._iter == 0:
-            print("[State 4] 夾爪張開，準備移動手臂…")
-            self.arm.set_last_joint_angle(70.0) # PyBullet 模擬器極限張開
+            print("[State 4] 手臂舉起準備壓門把，夾爪張開 (發布實體車軌跡)…")
+            # 實體車手臂指令: arm_1=120°, arm_2=90°, gripper=240° (全開)
+            self.rc.publish_real_arm_trajectory(120.0, 90.0, 240.0)
             self._iter = 1
-            time.sleep(0.3)
-
-        # 車子在 State 2 已經因為 LiDAR 或 YOLO 深度達到 VS_STOP_DISTANCE (0.30m) 而精準停車。
-        # 所以 arm_x = VS_STOP_DISTANCE + CAMERA_X_OFFSET = 0.30 + (-0.15) = 0.15m
-        # 0.15m 完美落在 ARM_MAX_REACH (0.17m) 內，絕不超距，且關節角度更舒展！
-        
-        check_depth = self._last_knob_depth if self._last_knob_depth else VS_STOP_DISTANCE
-        arm_x = check_depth + CAMERA_X_OFFSET
-        
-        print(f"[State 4] 手臂可達！門距離={check_depth:.3f}m, 手臂目標X={arm_x:.3f}m")
-
-        x_target = arm_x
-        z_target = KNOB_Z_HEIGHT
-        x_above  = x_target
-        z_above  = z_target + PRESS_ABOVE_OFFSET
-        
-        try:
-            print("[State 4] 步驟1: 靠近車身並舉高 (由 PyBullet 規劃收縮姿態) 避免卡住門把")
-            retract_pos = [0.05, 0.0, 0.15]
-            self.arm.move_to_position(retract_pos)
-            time.sleep(0.3)
-
-            print(f"[State 4] 步驟2: 移到門把正上方 (X={x_above:.3f}m, Z={z_above:.3f}m)")
-            above_pos = [x_above, 0.0, z_above]
-            self.arm.move_to_position(above_pos)
+            # 等待手臂移動到位
+            print("[State 4] 等待手臂到位...")
+            time.sleep(2.0)
             
-            self._last_knob_x = x_target
-            self._last_knob_z = z_target
-            print("[State 4] 手臂已到達門把正上方，準備下壓")
+            print("[State 4] 手臂已準備好，準備下壓")
             self._transition(DoorOpenState.PRESS_DOWN)
-        except Exception as e:
-            print(f"[State 4] 移動失敗: {e}")
-            self._transition(DoorOpenState.ERROR)
 
         return False
 
@@ -504,25 +472,18 @@ class DoorOpenTask:
 
     def _state_press_down(self):
         if self._press_count == 0:
-            print("[State 5] 夾爪合起，壓住門把…")
-            self.arm.set_last_joint_angle(10.0)  # PyBullet 極限合攏
-            time.sleep(0.1)
-            self.arm.set_last_joint_angle(12.0)  # 退 2 度以防燒壞馬達
-            time.sleep(0.3)                       # 等待微調完成
+            print("[State 5] 夾爪合起夾住門把…")
+            # 實體車夾爪閉合限制為 168°
+            self.rc.publish_real_arm_trajectory(120.0, 90.0, 168.0)
+            time.sleep(1.0) # 等待夾爪抓緊
 
-            print(f"[State 5] 往下壓 {PRESS_Z_DOWN * 100:.1f}cm，目標: X={self._last_knob_x:.3f}m, Z={self._last_knob_z - PRESS_Z_DOWN:.3f}m")
-
-            try:
-                # 直接一步壓到目標高度
-                down_pos = [self._last_knob_x, 0.0, self._last_knob_z - PRESS_Z_DOWN]
-                self.arm.move_to_position(down_pos)
-                print("[State 5] 門把已壓下")
-                time.sleep(0.5)
-                self._transition(DoorOpenState.OPEN_DOOR)
-            except Exception as e:
-                print(f"[State 5] 下壓失敗: {e}")
-                self._transition(DoorOpenState.ERROR)
-
+            print("[State 5] 手臂往下壓…")
+            # 往下壓，調整 arm_1 的角度。此處將 arm_1 降至 90°
+            self.rc.publish_real_arm_trajectory(90.0, 90.0, 168.0)
+            time.sleep(1.5) # 等待手臂壓下
+            
+            print("[State 5] 門把已壓下")
+            self._transition(DoorOpenState.OPEN_DOOR)
             self._press_count = 1
 
         return False
@@ -539,9 +500,14 @@ class DoorOpenTask:
         elapsed = time.time() - self._open_start
 
         if elapsed < OPEN_DOOR_DURATION:
-            self.car.update_action(DOOR_OPEN_ACTION)
+            if DOOR_OPEN_ACTION == "BACKWARD_SLOW":
+                self.rc.publish_cmd_vel(-0.2, 0.0)
+            elif DOOR_OPEN_ACTION == "FORWARD_SLOW":
+                self.rc.publish_cmd_vel(0.15, 0.0)
+            else:
+                self.rc.publish_cmd_vel(-0.2, 0.0) # 預設後退
         else:
-            self.car.update_action("STOP")
+            self.rc.publish_cmd_vel(0.0, 0.0)
             print("[State 6] 開門完成！")
             self._transition(DoorOpenState.DONE)
 
@@ -561,9 +527,8 @@ class DoorOpenTask:
             self.rc.publish_target_label("")
             try:
                 print("[FSM] 釋放夾爪並重置手臂姿態…")
-                self.arm.set_last_joint_angle(70.0) # 鬆開夾爪
+                self.rc.publish_real_arm_trajectory(90.0, 90.0, 240.0)
                 time.sleep(0.5)
-                self.arm.reset_arm(all_angle_degrees=90.0)                 # 回歸初始姿態
             except Exception as e:
                 print(f"[FSM] 重置手臂失敗: {e}")
 
