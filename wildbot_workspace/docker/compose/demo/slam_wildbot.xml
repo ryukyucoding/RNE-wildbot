@@ -1,0 +1,7 @@
+<launch>
+    <!-- Wildbot 實車 SLAM：使用 00_start_all 已啟動的 /scan，不重複開 LiDAR -->
+    <arg name="slam_params_file_path" default="$(dirname)/slam_params_wildbot.yaml"/>
+    <include file="$(find-pkg-share slam_toolbox)/launch/online_sync_launch.py">
+        <arg name="slam_params_file" value="$(var slam_params_file_path)"/>
+    </include>
+</launch>

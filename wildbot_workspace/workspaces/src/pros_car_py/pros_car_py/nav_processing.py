@@ -254,6 +254,9 @@ class Nav2Processing:
         self._vs_filtered_dx = None
         self._vs_filtered_depth = None
 
+    def get_filtered_dx_px(self):
+        return self._vs_filtered_dx
+
     def compute_yaw_wheel_from_pixel(
         self,
         dx_px: float,
@@ -290,18 +293,25 @@ class Nav2Processing:
             ratio = math.tanh(abs_err / scale)
             yaw_mag = ratio * cap * 1.12
         else:
-            ratio = math.tanh(abs_err / max(scale * 0.75, 30.0))
-            yaw_mag = ratio * cap * 0.95
+            ratio = math.tanh(abs_err / max(scale * 0.95, 45.0))
+            yaw_mag = ratio * cap * 0.42
 
         yaw_cmd = math.copysign(yaw_mag, err)
 
-        # 大偏差保底：至少 min_yaw_large_px 等效輪速
+        # 中小偏差（約 20–80px）：再限幅，避免 -40px 就轉半圈
+        if abs_err < 80.0:
+            moderate_cap = cap * max(0.12, abs_err / max(scale * 1.1, 60.0))
+            if abs(yaw_cmd) > moderate_cap:
+                yaw_cmd = math.copysign(moderate_cap, err)
+
+        # 大偏差保底：與 yaw cap 成比例，避免 cap 很小時仍打滿
+        effective_min = min(float(min_yaw_large_px), cap * 0.55)
         if abs_err >= 85.0:
-            floor = min(cap, float(min_yaw_large_px))
+            floor = effective_min
             if abs(yaw_cmd) < floor:
                 yaw_cmd = math.copysign(floor, err)
         if abs_err >= 180.0:
-            strong_floor = min(cap, float(min_yaw_large_px) * 1.35)
+            strong_floor = min(cap, effective_min * 1.15)
             if abs(yaw_cmd) < strong_floor:
                 yaw_cmd = math.copysign(strong_floor, err)
 
@@ -335,6 +345,7 @@ class Nav2Processing:
         pixel_offset_bias_px=0.0,
         dx_ema_alpha=0.25,
         depth_ema_alpha=0.35,
+        near_grasp_slowdown_enabled=True,
         yolo_target_info=None,
     ):
         """
@@ -381,12 +392,19 @@ class Nav2Processing:
                 return [-spin, spin, -spin, spin]
         else:
             self._vs_last_seen_time = now
+            # YOLO 大幅反跳（正負互換）：多半是換框/短暫誤判，不要硬切轉向
+            if self._vs_filtered_dx is not None:
+                dx_jump = x_offset_px - self._vs_filtered_dx
+                if abs(dx_jump) > 100.0 and x_offset_px * self._vs_filtered_dx < 0.0:
+                    x_offset_px = self._vs_filtered_dx
             # EMA 濾波：平滑 YOLO dx 幀間跳動（alpha 越小越平滑，越慢響應）
             alpha_dx = max(0.05, min(1.0, float(dx_ema_alpha)))
             if self._vs_filtered_dx is None:
                 self._vs_filtered_dx = x_offset_px
             else:
-                self._vs_filtered_dx = alpha_dx * x_offset_px + (1.0 - alpha_dx) * self._vs_filtered_dx
+                self._vs_filtered_dx = (
+                    alpha_dx * x_offset_px + (1.0 - alpha_dx) * self._vs_filtered_dx
+                )
             x_offset_px = self._vs_filtered_dx
 
             # EMA 濾波：平滑 depth 跳動
@@ -435,8 +453,7 @@ class Nav2Processing:
                     forward_cmd = max(fwd_cap * 0.85, forward_cmd)
             else:
                 forward_cmd = min(fwd_cap, forward_cmd)
-            # 進入 grasp 前段：距離越近越強制降速（避免直衝停不住）
-            if depth <= target_depth_m + 0.55:
+            if near_grasp_slowdown_enabled and depth <= target_depth_m + 0.55:
                 t = max(0.0, (depth - target_depth_m) / 0.55)
                 forward_cmd = min(
                     forward_cmd,
@@ -459,6 +476,19 @@ class Nav2Processing:
             # 大角度偏差時降低前進，讓轉向輪速主導（避免弧線往反側偏）
             misalign = min(1.0, abs(x_offset_px) / 260.0)
             forward_cmd *= max(0.30, 1.0 - 0.62 * misalign)
+
+        # 有前進意圖時限制 yaw，避免邊快進邊大角轉向
+        if depth_valid and abs(forward_cmd) > 20.0:
+            if abs(x_offset_px) < 100.0:
+                yaw_arc_cap = max(28.0, abs(forward_cmd) * 0.38)
+            else:
+                misalign = min(1.0, abs(x_offset_px) / 240.0)
+                yaw_arc_cap = max(
+                    6.0,
+                    min(yaw_cap * 0.55, abs(forward_cmd) * 0.22 * (1.15 - misalign)),
+                )
+            if abs(yaw_cmd) > yaw_arc_cap:
+                yaw_cmd = math.copysign(yaw_arc_cap, yaw_cmd)
 
         forward_cmd = max(-fwd_cap, min(fwd_cap, forward_cmd))
 

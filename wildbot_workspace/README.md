@@ -56,6 +56,18 @@ The `scripts/` folder launches the car's built-in hardware (motors, camera, LiDA
 
 Press `Ctrl+C` to stop all services launched by that script.
 
+### 4. Map → AMCL → Nav2（實車回家）
+
+See repo root `COMMANDS.md` section **實車建圖 → AMCL → Nav2 回家**, or:
+
+```bash
+./scripts/00_start_all.sh          # hardware
+./scripts/01_mapping.sh            # first time only: SLAM
+./scripts/02_save_map.sh           # save maps/map01/
+./scripts/03_localization_nav.sh   # AMCL + Nav2 (after map exists)
+./scripts/verify_nav.sh            # run inside a ROS container on same network
+./scripts/stop_nav_stack.sh        # stop nav without stopping hardware
+```
 ### 3. Run your own ROS 2 nodes
 
 Place your ROS 2 packages in `workspaces/src/`, then use one of the two launch methods:

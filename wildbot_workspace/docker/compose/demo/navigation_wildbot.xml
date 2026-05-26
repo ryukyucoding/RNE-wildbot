@@ -1,0 +1,10 @@
+<launch>
+    <arg name="map_file" default="/workspace/maps/map01/map01.yaml"/>
+    <arg name="params_file" default="$(dirname)/mapper_params_wildbot.yaml"/>
+
+    <include file="$(find-pkg-share nav2_bringup)/launch/navigation_launch.py">
+        <arg name="slam" value="False"/>
+        <arg name="map" value="$(var map_file)"/>
+        <arg name="params_file" value="$(var params_file)"/>
+    </include>
+</launch>

@@ -31,7 +31,7 @@ elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); 
             -v "$(pwd)/src:/workspaces/src" \
             -v "$(pwd)/screenshots:/workspaces/screenshots" \
             -v "$(pwd)/fps_screenshots:/workspaces/fps_screenshots" \
-            registry.screamtrumpet.csie.ncku.edu.tw/screamlab/pros_cameraapi:0.0.2 \
+            yolo_cyclone:latest \
             /bin/bash
     else
         echo "Trying to run with GPU support..."
@@ -43,7 +43,7 @@ elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); 
             -v "$(pwd)/src:/workspaces/src" \
             -v "$(pwd)/screenshots:/workspaces/screenshots" \
             -v "$(pwd)/fps_screenshots:/workspaces/fps_screenshots" \
-            registry.screamtrumpet.csie.ncku.edu.tw/screamlab/pros_cameraapi:0.0.2 \
+            yolo_cyclone:latest \
             /bin/bash
 
         # 如果上一個指令失敗，則改用不帶 GPU 的版本
@@ -56,7 +56,7 @@ elif [ "$ARCH" = "x86_64" ] || ([ "$ARCH" = "arm64" ] && [ "$OS" = "Darwin" ]); 
                 -v "$(pwd)/src:/workspaces/src" \
                 -v "$(pwd)/screenshots:/workspaces/screenshots" \
                 -v "$(pwd)/fps_screenshots:/workspaces/fps_screenshots" \
-                registry.screamtrumpet.csie.ncku.edu.tw/screamlab/pros_cameraapi:0.0.2 \
+                yolo_cyclone:latest \
                 /bin/bash
         fi
     fi

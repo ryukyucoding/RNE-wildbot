@@ -11,7 +11,15 @@ RUN cp -r ./workspaces/* /workspaces && \
     apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-demo-nodes-py \
         ros-${ROS_DISTRO}-demo-nodes-cpp \
-        ros-${ROS_DISTRO}-foxglove-bridge && \
+        ros-${ROS_DISTRO}-foxglove-bridge \
+        ros-${ROS_DISTRO}-nav2-bringup && \
+    apt-get install -y --only-upgrade \
+        ros-${ROS_DISTRO}-fastcdr \
+        ros-${ROS_DISTRO}-fastrtps \
+        ros-${ROS_DISTRO}-rmw-fastrtps-cpp \
+        ros-${ROS_DISTRO}-rmw-fastrtps-shared-cpp \
+        ros-${ROS_DISTRO}-rosidl-typesupport-fastrtps-cpp \
+        ros-${ROS_DISTRO}-rosidl-typesupport-fastrtps-c && \
     rosdep update --rosdistro ${ROS_DISTRO} && \
     colcon mixin update && \
     colcon metadata update

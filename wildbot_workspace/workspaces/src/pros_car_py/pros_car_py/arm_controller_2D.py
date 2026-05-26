@@ -36,7 +36,7 @@ class ArmController:
         self.joint_limits = [
             {"length": 0.08089007, "min_angle": -180, "max_angle": 0, "init": -180, "offset": 270,  "dir": -1.0},  # Joint 0 (Shoulder)
             {"length": 0.11,       "min_angle": -240, "max_angle": 0, "init": -0,   "offset": -120, "dir": -1.0},  # Joint 1 (Elbow)
-            {"length": 0.00,       "min_angle": 20,   "max_angle": 90, "init": 90,  "offset": 0.0,  "dir": 1.0},   # Joint 2 (Gripper)
+            {"length": 0.00,       "min_angle": 20,   "max_angle": 229, "init": 229,  "offset": 0.0,  "dir": 1.0},   # Joint 2 (Gripper)  229° * 1.0 dir = 4.0 rad (fully open)
         ]
 
         self.joint_angles = [joint["init"] for joint in self.joint_limits]
@@ -183,38 +183,46 @@ class ArmController:
     def run_release_blocking(self):
         """
         在「已經帶著目標回家」後同步執行放下：
-        1) 先回到安全姿態（避免夾爪過低卡住）
-        2) 打開夾爪釋放物件
+        1) 先開夾爪讓熊自然落地
+        2) 等熊落穩後再把手臂收回安全姿態
         """
         try:
-            print("🧺 [release] 回到安全姿態...")
+            print("🧺 [release] 打開夾爪放下目標...")
+            target_open = [None, None, self.joint_limits[2]["max_angle"]]
+            self._smooth_move_to(target_open, step=5.0, delay=0.1)
+            time.sleep(0.8)  # 等熊落地
+
+            print("🧺 [release] 手臂收回安全姿態...")
             init_angles = [None, self.joint_limits[1]["init"], None]
             self._smooth_move_to(init_angles, step=5.0, delay=0.1)
             init_angles = [self.joint_limits[0]["init"], None, None]
             self._smooth_move_to(init_angles, step=5.0, delay=0.1)
             time.sleep(0.3)
 
-            print("🧺 [release] 打開夾爪放下目標...")
-            target_open = [None, None, self.joint_limits[2]["max_angle"]]
-            self._smooth_move_to(target_open, step=5.0, delay=0.1)
-            time.sleep(0.5)
-            print("✅ [release] 目標已放下")
+            print("✅ [release] 目標已放下，手臂歸位")
             return True
         except Exception as e:
             print(f"⚠️ run_release_blocking 失敗: {e}")
             return False
 
     def _execute_grab_sequence(self):
-        """實體車抓取：原位夾緊 → 上抬"""
+        """實體車抓取：elbow 微降 → 原位夾緊 → 上抬"""
 
-        # 步驟 1：夾緊（手臂不動，只關夾爪）
-        print("✊ [1/2] 夾緊目標...")
+        # 步驟 1：夾取前 elbow 再低一點，讓夾爪更貼近熊
+        print("🦾 [1/3] Elbow 微降準備夾取...")
+        elbow_lower = self.joint_angles[1] - 12.0
+        elbow_lower = max(self.joint_limits[1]["min_angle"], elbow_lower)
+        self._smooth_move_to([None, elbow_lower, None], step=4.0, delay=0.08)
+        time.sleep(0.2)
+
+        # 步驟 2：夾緊
+        print("✊ [2/3] 夾緊目標...")
         target_close = [None, None, self.joint_limits[2]["min_angle"]]
         self._smooth_move_to(target_close, step=5.0, delay=0.1)
         time.sleep(0.8)
 
-        # 步驟 2：肩膀上抬 25 度，夾爪保持夾住
-        print("🏠 [2/2] 上抬固定...")
+        # 步驟 3：肩膀上抬 25 度，夾爪保持夾住
+        print("🏠 [3/3] 上抬固定...")
         shoulder_lift = self.joint_angles[0] - 25  # 負方向 = 抬起
         shoulder_lift = max(self.joint_limits[0]["min_angle"], shoulder_lift)
         self._smooth_move_to([shoulder_lift, None, None], step=5.0, delay=0.1)

@@ -1,5 +1,5 @@
 services:
-  lidar_pkg:
+  odom_tf_bridge:
     image: wildbot_workspace
     env_file:
       - .env
@@ -7,7 +7,7 @@ services:
       - ./demo:/workspace/demo:ro
     networks:
       - my_bridge_network
-    command: "python3 /workspace/demo/scan_sanitize_node.py"
+    command: "python3 /workspace/demo/odom_tf_bridge.py"
 
 networks:
   my_bridge_network:

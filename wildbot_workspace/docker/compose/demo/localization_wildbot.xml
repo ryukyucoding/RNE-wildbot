@@ -1,0 +1,11 @@
+<launch>
+    <!-- Wildbot 實車 AMCL：載入 maps/map01，需先跑過 01_mapping + 02_save_map -->
+    <arg name="map_file" default="/workspace/maps/map01/map01.yaml"/>
+    <arg name="params_file" default="$(dirname)/mapper_params_wildbot.yaml"/>
+
+    <include file="$(find-pkg-share nav2_bringup)/launch/localization_launch.py">
+        <arg name="slam" value="False"/>
+        <arg name="map" value="$(var map_file)"/>
+        <arg name="params_file" value="$(var params_file)"/>
+    </include>
+</launch>

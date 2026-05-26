@@ -1,0 +1,17 @@
+services:
+  # /scan 的 frame_id 是 lidar，但 oradarlidar 舊版發的是 base_link→laser
+  lidar_tf:
+    image: wildbot_workspace
+    env_file:
+      - .env
+    networks:
+      - my_bridge_network
+    command: >
+      ros2 run tf2_ros static_transform_publisher
+      --x 0.165 --y 0.0 --z 0.18
+      --roll 0 --pitch 0 --yaw 0
+      --frame-id base_link --child-frame-id lidar
+
+networks:
+  my_bridge_network:
+    driver: bridge

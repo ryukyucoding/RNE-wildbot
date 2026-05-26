@@ -71,7 +71,8 @@ class RosCommunicator(Node):
         self.latest_lidar = None
         self._lidar_missing_warn_time = 0.0
         self.subscriber_lidar = self.create_subscription(
-            LaserScan, "/scan", self.subscriber_lidar_callback, 1
+            LaserScan, "/scan", self.subscriber_lidar_callback,
+            QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT),
         )
 
         # subscribe global_plan

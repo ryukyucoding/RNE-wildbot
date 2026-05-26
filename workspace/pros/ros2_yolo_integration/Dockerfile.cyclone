@@ -1,0 +1,10 @@
+FROM registry.screamtrumpet.csie.ncku.edu.tw/screamlab/pros_cameraapi:0.0.2
+
+# 更新過期的 ROS2 GPG key，再安裝 CycloneDDS
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key | \
+        gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --allow-unauthenticated ros-humble-rmw-cyclonedds-cpp && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

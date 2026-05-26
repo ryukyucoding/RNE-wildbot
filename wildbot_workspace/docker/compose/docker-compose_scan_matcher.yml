@@ -1,0 +1,17 @@
+services:
+  scan_matcher:
+    image: registry.screamtrumpet.csie.ncku.edu.tw/alianlbj23/oradar_lidar_image:v1.0.2
+    env_file:
+      - .env
+    networks:
+      - my_bridge_network
+    command: >
+      ros2 run ros2_laser_scan_matcher laser_scan_matcher
+      --ros-args
+      -p base_frame:=base_link
+      -p publish_tf:=true
+      -p publish_odom:=/odom
+
+networks:
+  my_bridge_network:
+    driver: bridge

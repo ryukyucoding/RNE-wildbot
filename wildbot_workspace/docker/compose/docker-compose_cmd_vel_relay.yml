@@ -1,13 +1,13 @@
 services:
-  lidar_pkg:
-    image: wildbot_workspace
+  cmd_vel_relay:
+    image: ghcr.io/screamlab/wildbot_base_image:latest
     env_file:
       - .env
     volumes:
       - ./demo:/workspace/demo:ro
     networks:
       - my_bridge_network
-    command: "python3 /workspace/demo/scan_sanitize_node.py"
+    command: "python3 /workspace/demo/cmd_vel_relay.py"
 
 networks:
   my_bridge_network:

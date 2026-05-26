@@ -1,13 +1,14 @@
 services:
-  lidar_pkg:
+  localization:
     image: wildbot_workspace
     env_file:
       - .env
     volumes:
       - ./demo:/workspace/demo:ro
+      - ../../maps:/workspace/maps:ro
     networks:
       - my_bridge_network
-    command: "python3 /workspace/demo/scan_sanitize_node.py"
+    command: "ros2 launch /workspace/demo/localization_wildbot.xml"
 
 networks:
   my_bridge_network:

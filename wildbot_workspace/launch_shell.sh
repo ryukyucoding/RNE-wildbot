@@ -45,6 +45,10 @@ fi
 
 # 啟動
 echo "[wildbot] starting container..."
+if docker ps -a --format '{{.Names}}' | grep -qx wildbot; then
+  echo "[wildbot] 移除舊 wildbot container（須用新 build 的 image 才會生效）..."
+  docker rm -f wildbot
+fi
 docker run -it \
   --name wildbot \
   --rm \

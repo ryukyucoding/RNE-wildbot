@@ -6,6 +6,7 @@
   - pros_car：`ros2 run pros_car_py bear_mission`，或 `ros2 launch pros_car_py bear_task1.launch.py`（僅 bear_mission）
 
 預設 **auto_start:=true**：延遲後自動跑完整流程；手動觸發：`auto_start:=false` 再呼叫 `/start_bear_mission`。
+預設 **repeat_mission:=true**：一輪結束後立即開始下一輪，直到 Ctrl+C 停止；單次執行：`-p repeat_mission:=false`。
 
 請勿與 `robot_control` 同時對底盤發輪速。
 
@@ -23,7 +24,7 @@ from typing import Tuple
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Quaternion
 try:
     from nav2_msgs.action import NavigateToPose
     from nav2_msgs.srv import ClearEntireCostmap
@@ -32,6 +33,14 @@ except ImportError:
     NavigateToPose = None
     ClearEntireCostmap = None
     _NAV2_AVAILABLE = False
+try:
+    from lifecycle_msgs.msg import State as LifecycleState
+    from lifecycle_msgs.srv import GetState as LifecycleGetState
+    _LIFECYCLE_AVAILABLE = True
+except ImportError:
+    LifecycleState = None
+    LifecycleGetState = None
+    _LIFECYCLE_AVAILABLE = False
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from std_srvs.srv import Trigger
@@ -69,16 +78,16 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("approach_period_sec", 0.1)
         self.declare_parameter("approach_timeout_sec", 120.0)
         self.declare_parameter("visual_servo_enabled", True)
-        self.declare_parameter("visual_servo_target_depth_m", 0.55)
+        self.declare_parameter("visual_servo_target_depth_m", 0.38)
         self.declare_parameter("visual_servo_search_spin_speed", 130.0)
         self.declare_parameter("visual_servo_max_forward_speed", 170.0)
         self.declare_parameter("visual_servo_max_forward_speed_far", 390.0)
         self.declare_parameter("visual_servo_far_distance_m", 0.90)
-        self.declare_parameter("visual_servo_yaw_deadband_px", 12.0)
-        self.declare_parameter("visual_servo_yaw_soft_scale_px", 100.0)
-        self.declare_parameter("visual_servo_max_yaw_near", 175.0)
-        self.declare_parameter("visual_servo_max_yaw_far", 300.0)
-        self.declare_parameter("visual_servo_min_yaw_large_px", 115.0)
+        self.declare_parameter("visual_servo_yaw_deadband_px", 24.0)
+        self.declare_parameter("visual_servo_yaw_soft_scale_px", 150.0)
+        self.declare_parameter("visual_servo_max_yaw_near", 90.0)
+        self.declare_parameter("visual_servo_max_yaw_far", 110.0)
+        self.declare_parameter("visual_servo_min_yaw_large_px", 85.0)
         self.declare_parameter("approach_turn_stuck_time_sec", 2.0)
         self.declare_parameter("approach_stuck_time_sec", 3.0)
         self.declare_parameter("approach_stuck_back_sec", 0.55)
@@ -94,7 +103,7 @@ class BearMissionHost(RosCommunicator):
         # 切入慢速對齊的距離閾值
         self.declare_parameter("approach_slow_dist_m", 0.90)
         # 低於此深度 or 熊消失 → 立刻停下夾取
-        self.declare_parameter("grasp_trigger_dist_m", 0.65)
+        self.declare_parameter("grasp_trigger_dist_m", 0.40)
         # 熊剛消失後再多等幾幀再夾（等車身慣性停穩）
         self.declare_parameter("grasp_trigger_lost_frames", 3)
         # bbox 寬度超過此像素數 → 視為足夠近，觸發夾爪（0 = 停用）
@@ -103,7 +112,7 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("grasp_confirm_frames", 4)
         self.declare_parameter("grasp_depth_jump_m", 0.35)
         # 前瞻煞車：用 v²/(2a) 估算「現在這個速度要多久、多遠才停得住」
-        self.declare_parameter("approach_stop_dist_m", 0.55)
+        self.declare_parameter("approach_stop_dist_m", 0.35)
         self.declare_parameter("approach_decel_mps2", 0.45)
         self.declare_parameter("approach_max_speed_mps", 0.55)
         self.declare_parameter("approach_brake_safety_m", 0.12)
@@ -113,7 +122,7 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("grasp_depth_min_m", 0.12)
         self.declare_parameter("marker_wait_sec", 3.0)
         self.declare_parameter("nav_home_timeout_sec", 180.0)
-        self.declare_parameter("home_reached_dist_thresh_m", 0.30)
+        self.declare_parameter("home_reached_dist_thresh_m", 0.50)
         self.declare_parameter("nav_retry_count", 1)
         self.declare_parameter("nav_feedback_log_sec", 1.5)
         self.declare_parameter("nav_stuck_time_sec", 8.0)
@@ -128,8 +137,11 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("fallback_rotate_step_sec", 0.18)
         self.declare_parameter("fallback_forward_step_sec", 0.20)
         self.declare_parameter("drop_at_home", True)
+        self.declare_parameter("align_home_heading_after_drop", True)
+        self.declare_parameter("home_heading_align_timeout_sec", 25.0)
         self.declare_parameter("auto_start", True)
         self.declare_parameter("auto_start_delay_sec", 2.0)
+        self.declare_parameter("repeat_mission", True)
         self.declare_parameter("amcl_wait_timeout_sec", 120.0)
         self.declare_parameter("obstacle_guard_enabled", True)
         self.declare_parameter("obstacle_stop_m", -1.0)
@@ -145,6 +157,16 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("obstacle_scale_floor_mid", 0.30)
         self.declare_parameter("obstacle_scale_floor_slow", 0.20)
         # YOLO 丟失後的緩衝 / 搜尋狀態機參數
+        # 最後補進：熊脫離相機視野時，依最後記錄的距離與方向前進補足後再夾
+        self.declare_parameter("grasp_final_nudge_enabled", True)
+        self.declare_parameter("grasp_final_nudge_wheel_speed", 130.0)
+        self.declare_parameter("grasp_final_nudge_max_sec", 1.8)
+        self.declare_parameter("grasp_final_nudge_min_sec", 0.45)
+        # 熊在此距離內消失 → 先後退一小段重找，仍找不到才記憶抓取
+        self.declare_parameter("grasp_commit_dist_m", -1.0)
+        self.declare_parameter("approach_yolo_lost_back_enabled", True)
+        self.declare_parameter("approach_yolo_lost_back_sec", 0.55)
+        self.declare_parameter("approach_yolo_lost_back_max_attempts", 2)
         self.declare_parameter("approach_yolo_lost_grace_sec", 1.5)
         self.declare_parameter("approach_yolo_lost_min_frames", 12)
         self.declare_parameter("approach_yolo_search_spin_speed_tier", "slow")
@@ -152,6 +174,8 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("approach_yolo_explore_forward_sec", 2.0)
         self.declare_parameter("approach_yolo_explore_forward_speed", 180.0)
         self.declare_parameter("approach_yolo_lost_motion_log_sec", 2.0)
+        self.declare_parameter("status_log_interval_sec", 1.0)
+        self.declare_parameter("mission_verbose_log", False)
 
         self._mission_busy = threading.Lock()
         self._running = False
@@ -171,9 +195,18 @@ class BearMissionHost(RosCommunicator):
                 .double_value,
             )
             self._auto_start_timer = self.create_timer(delay, self._on_auto_start_timer)
+            repeat = (
+                self.get_parameter("repeat_mission").get_parameter_value().bool_value
+            )
+            repeat_hint = (
+                "完成後自動接下一輪（Ctrl+C 停止）。"
+                if repeat
+                else "單次執行（repeat_mission:=false）。"
+            )
             self.get_logger().info(
                 f"auto_start enabled: full pipeline begins in {delay:.1f}s "
                 "(record home → approach → grasp → nav home). "
+                f"{repeat_hint} "
                 "Set auto_start:=false to use /start_bear_mission only."
             )
         else:
@@ -212,8 +245,23 @@ class BearMissionHost(RosCommunicator):
         return response
 
     def _run_mission_safe(self):
+        repeat_mission = (
+            self.get_parameter("repeat_mission").get_parameter_value().bool_value
+        )
+        round_num = 0
         try:
-            self._run_mission()
+            while rclpy.ok():
+                round_num += 1
+                if repeat_mission and round_num > 1:
+                    self.get_logger().info(
+                        f"=== 第 {round_num} 輪夾熊任務開始（Ctrl+C 停止）==="
+                    )
+                self._run_mission()
+                if not repeat_mission or not rclpy.ok():
+                    break
+                self.get_logger().info(
+                    f"=== 第 {round_num} 輪完成，立即開始下一輪（Ctrl+C 停止）==="
+                )
         finally:
             self._running = False
             if rclpy.ok():
@@ -281,12 +329,163 @@ class BearMissionHost(RosCommunicator):
         )
 
     @staticmethod
+    def _zone_name_cn(zone: str) -> str:
+        return {"far": "遠距", "mid": "中距", "slow": "近距"}.get(zone, zone)
+
+    @staticmethod
+    def _turn_dir_cn(raw_dx: float, deadband_px: float) -> str:
+        if raw_dx < -deadband_px:
+            return "左轉對準"
+        if raw_dx > deadband_px:
+            return "右轉對準"
+        return "直進"
+
+    @staticmethod
+    def _block_cmd_cn(block_cmd: str | None) -> str | None:
+        mapping = {
+            "STOP": "停車",
+            "CLOCKWISE_ROTATION": "右轉閃避",
+            "COUNTERCLOCKWISE_ROTATION": "左轉閃避",
+        }
+        return mapping.get(block_cmd) if block_cmd else None
+
+    def _obstacle_summary_cn(self, obs) -> str:
+        block = self._block_cmd_cn(obs.block_cmd)
+        if block:
+            side = ""
+            if obs.block_cmd == "CLOCKWISE_ROTATION":
+                side = "（左側障礙）"
+            elif obs.block_cmd == "COUNTERCLOCKWISE_ROTATION":
+                side = "（右側障礙）"
+            elif obs.block_cmd == "STOP":
+                side = "（前方過近）"
+            return f"障礙→{block}{side}"
+
+        notes: list[str] = []
+        if math.isfinite(obs.left_clearance_m) and math.isfinite(obs.right_clearance_m):
+            if obs.left_clearance_m + 0.08 < obs.right_clearance_m:
+                notes.append(f"左側較近 {obs.left_clearance_m:.2f}m")
+            elif obs.right_clearance_m + 0.08 < obs.left_clearance_m:
+                notes.append(f"右側較近 {obs.right_clearance_m:.2f}m")
+        if math.isfinite(obs.front_clearance_m) and obs.front_clearance_m < 0.55:
+            notes.append(f"前方 {obs.front_clearance_m:.2f}m")
+        if obs.speed_scale < 0.98:
+            notes.append(f"減速 x{obs.speed_scale:.2f}")
+        return "路徑暢通" if not notes else "，".join(notes)
+
+    def _log_status_if_due(
+        self,
+        last_log_time: float,
+        interval_sec: float,
+        message: str,
+    ) -> float:
+        now = time.monotonic()
+        if now - last_log_time < interval_sec:
+            return last_log_time
+        self.get_logger().info(f"[狀態] {message}")
+        return now
+
+    def _build_approach_status_cn(
+        self,
+        *,
+        use_approach: bool,
+        yolo_search_confirmed: bool,
+        in_hold: bool,
+        target_live: bool,
+        yolo_search_state: dict,
+        dist: float,
+        last_valid_dist: float | None,
+        control_dx: float,
+        yolo_dx: float | None,
+        deadband_px: float,
+        zone_far: float,
+        zone_mid: float,
+        obs,
+    ) -> str:
+        obs_text = self._obstacle_summary_cn(obs) if obs is not None else "路徑暢通"
+        if yolo_search_confirmed:
+            phase = yolo_search_state.get("phase", "spin")
+            if phase == "back_peek":
+                mode = "後退尋找"
+            elif phase == "explore":
+                mode = "前進探索"
+            else:
+                acc_deg = math.degrees(float(yolo_search_state.get("accumulated_rad", 0.0)))
+                mode = f"原地旋轉搜尋（已轉 {acc_deg:.0f}°）"
+            dist_hint = (
+                f"，上次距離 {last_valid_dist:.2f}m"
+                if last_valid_dist is not None
+                else ""
+            )
+            return f"找尋目標｜{mode}{dist_hint}｜{obs_text}"
+
+        d_eff = dist if dist > 0.0 else (last_valid_dist if last_valid_dist is not None else -1.0)
+        if d_eff <= 0.0:
+            phase = "等待偵測"
+        elif d_eff > zone_far:
+            phase = "全速接近"
+        elif d_eff > zone_mid:
+            phase = "中速接近"
+        else:
+            phase = "慢速接近"
+
+        target_tag = "即時" if target_live else ("沿用" if in_hold else "未知")
+        turn = self._turn_dir_cn(control_dx, deadband_px)
+        dist_text = f"{d_eff:.2f}m" if d_eff > 0.0 else "未知"
+        if yolo_dx is not None and abs(yolo_dx - control_dx) > 30.0:
+            dx_text = (
+                f"控制 {control_dx:+.0f}px，YOLO {yolo_dx:+.0f}px（{target_tag}）"
+            )
+        else:
+            dx_text = f"偏差 {control_dx:+.0f}px（{target_tag}）"
+        return (
+            f"接近目標｜{phase}｜{turn}｜"
+            f"距離 {dist_text}（{dx_text}）｜{obs_text}"
+        )
+
+    def _build_nav_status_cn(
+        self,
+        *,
+        attempt: int,
+        attempt_total: int,
+        home_dist: float | None,
+        nav_feedback_dist: float | None,
+        obs,
+    ) -> str:
+        obs_text = self._obstacle_summary_cn(obs) if obs is not None else "路徑暢通"
+        if home_dist is not None:
+            dist_text = f"距起點 {home_dist:.2f}m"
+        else:
+            dist_text = "距起點 未知"
+        nav2_text = (
+            f"，Nav2 剩餘 {nav_feedback_dist:.2f}m"
+            if nav_feedback_dist is not None
+            else ""
+        )
+        return (
+            f"回程導航（第 {attempt}/{attempt_total} 次）｜"
+            f"{dist_text}{nav2_text}｜{obs_text}"
+        )
+
+    @staticmethod
     def _reset_yolo_search_state(state: dict) -> None:
         state["phase"] = "idle"
         state["accumulated_rad"] = 0.0
         state["last_yaw"] = None
         state["explore_until"] = 0.0
         state["logged_spin"] = False
+        state["back_until"] = 0.0
+        state["logged_back"] = False
+        state["back_attempts"] = 0
+
+    @staticmethod
+    def _close_range_lost(
+        last_valid_dist: float | None, grasp_commit_dist_m: float
+    ) -> bool:
+        return (
+            last_valid_dist is not None
+            and last_valid_dist <= grasp_commit_dist_m
+        )
 
     @staticmethod
     def _target_live(yolo_target_info) -> bool:
@@ -296,6 +495,66 @@ class BearMissionHost(RosCommunicator):
             float(yolo_target_info[0]) == 1.0
             and float(yolo_target_info[1]) > 0.0
         )
+
+    @staticmethod
+    def _should_memory_grasp_commit(
+        *,
+        target_live: bool,
+        last_valid_dist: float | None,
+        lost_frames: int,
+        grasp_commit_dist_m: float,
+        min_lost_frames: int = 1,
+        back_enabled: bool = False,
+        back_attempts: int = 0,
+        back_max_attempts: int = 0,
+    ) -> bool:
+        """熊在 commit 距離內消失 → 後退重找仍失敗後，用記憶位置直接抓取。"""
+        if target_live or last_valid_dist is None:
+            return False
+        if not (
+            last_valid_dist <= grasp_commit_dist_m
+            and lost_frames >= max(1, min_lost_frames)
+        ):
+            return False
+        if back_enabled and back_attempts < back_max_attempts:
+            return False
+        return True
+
+    def _home_dist_from_amcl(self, home_pose) -> float | None:
+        amcl_pose_msg = self.get_latest_amcl_pose()
+        if amcl_pose_msg is None or home_pose is None:
+            return None
+        return self._dist_xy(amcl_pose_msg.pose.pose, home_pose)
+
+    def _log_nav2_inactive_help(self) -> None:
+        self.get_logger().error(
+            "[nav] bt_navigator 未 active，NavigateToPose 會 reject goal。"
+            "請依序執行：./scripts/set_initial_pose.sh → ./scripts/restart_navigation.sh"
+            "（或 ./scripts/verify_nav.sh 確認全部 OK）"
+        )
+
+    def _is_bt_navigator_active(self) -> bool | None:
+        """Return True/False when lifecycle service responds; None if unavailable."""
+        if not _LIFECYCLE_AVAILABLE or LifecycleGetState is None:
+            return None
+        if not hasattr(self, "_bt_nav_get_state_client"):
+            self._bt_nav_get_state_client = self.create_client(
+                LifecycleGetState, "/bt_navigator/get_state"
+            )
+        client = self._bt_nav_get_state_client
+        if not client.wait_for_service(timeout_sec=1.5):
+            return None
+        future = client.call_async(LifecycleGetState.Request())
+        t0 = time.monotonic()
+        while not future.done() and time.monotonic() - t0 < 2.0:
+            time.sleep(0.02)
+        if not future.done():
+            return None
+        try:
+            state_id = future.result().current_state.id
+        except Exception:
+            return None
+        return state_id == LifecycleState.PRIMARY_STATE_ACTIVE
 
     @staticmethod
     def _spin_action_names(speed_tier: str) -> tuple[str, str]:
@@ -478,6 +737,35 @@ class BearMissionHost(RosCommunicator):
                     return cw
         return ccw
 
+    @staticmethod
+    def _side_obs_yaw_correction(
+        dp: DataProcessor,
+        guard: ObstacleGuard,
+        max_yaw: float = 60.0,
+    ) -> tuple[float, float | None, float | None]:
+        """
+        LiDAR 左右扇區（38°–72°）→ 疊加在 visual servo 上的 yaw 補正。
+        正值 = 右轉（閃左側障礙），負值 = 左轉（閃右側障礙）。
+        前方扇區（±35°）不做判斷，讓 visual servo 自行控制。
+        Returns (yaw_correction, left_m, right_m).
+        """
+        try:
+            _, left_m, right_m = get_lidar_sector_minimums(dp)
+        except Exception:
+            return 0.0, None, None
+
+        slow_m = guard.slow_m
+        stop_m = guard.stop_m
+
+        def _c(dist: float | None) -> float:
+            if dist is None or not math.isfinite(dist) or dist >= slow_m:
+                return 0.0
+            t = max(0.0, (dist - stop_m) / max(slow_m - stop_m, 0.01))
+            return max_yaw * (1.0 - t)
+
+        yaw = _c(left_m) - _c(right_m)
+        return yaw, left_m, right_m
+
     def _pick_unstick_lateral_key(
         self,
         dp: DataProcessor,
@@ -512,10 +800,13 @@ class BearMissionHost(RosCommunicator):
         prefix: str = "obstacle",
         dp: DataProcessor | None = None,
         source_debug_enabled: bool = False,
+        emit_detail: bool = True,
     ) -> float:
         now = time.monotonic()
         if now - last_log_time < log_interval:
             return last_log_time
+        if not emit_detail:
+            return now
         raw_f = obs.sensor_front_m
         raw_str = f"{raw_f:.2f}" if math.isfinite(raw_f) else "n/a"
         self.get_logger().info(
@@ -608,6 +899,7 @@ class BearMissionHost(RosCommunicator):
         approach_mode: bool = False,
         speed_scale_floor: float | None = None,
         source_debug_enabled: bool = False,
+        emit_detail: bool = True,
     ) -> float:
         if not rclpy.ok():
             return last_log_time
@@ -634,6 +926,7 @@ class BearMissionHost(RosCommunicator):
             prefix=prefix,
             dp=dp,
             source_debug_enabled=source_debug_enabled,
+            emit_detail=emit_detail,
         )
 
         if wheel_cmd is not None:
@@ -796,6 +1089,21 @@ class BearMissionHost(RosCommunicator):
             0.05,
             min(1.0, self.get_parameter("visual_servo_depth_ema_alpha").get_parameter_value().double_value),
         )
+        grasp_final_nudge_enabled = (
+            self.get_parameter("grasp_final_nudge_enabled").get_parameter_value().bool_value
+        )
+        grasp_final_nudge_wheel_speed = max(
+            40.0,
+            self.get_parameter("grasp_final_nudge_wheel_speed").get_parameter_value().double_value,
+        )
+        grasp_final_nudge_max_sec = max(
+            0.1,
+            self.get_parameter("grasp_final_nudge_max_sec").get_parameter_value().double_value,
+        )
+        grasp_final_nudge_min_sec = max(
+            0.0,
+            self.get_parameter("grasp_final_nudge_min_sec").get_parameter_value().double_value,
+        )
         approach_yolo_lost_grace_sec = max(
             0.3,
             self.get_parameter("approach_yolo_lost_grace_sec")
@@ -806,6 +1114,25 @@ class BearMissionHost(RosCommunicator):
             3,
             int(
                 self.get_parameter("approach_yolo_lost_min_frames")
+                .get_parameter_value()
+                .integer_value
+            ),
+        )
+        approach_yolo_lost_back_enabled = (
+            self.get_parameter("approach_yolo_lost_back_enabled")
+            .get_parameter_value()
+            .bool_value
+        )
+        approach_yolo_lost_back_sec = max(
+            0.2,
+            self.get_parameter("approach_yolo_lost_back_sec")
+            .get_parameter_value()
+            .double_value,
+        )
+        approach_yolo_lost_back_max_attempts = max(
+            1,
+            int(
+                self.get_parameter("approach_yolo_lost_back_max_attempts")
                 .get_parameter_value()
                 .integer_value
             ),
@@ -847,6 +1174,15 @@ class BearMissionHost(RosCommunicator):
             self.get_parameter("obstacle_source_debug_enabled")
             .get_parameter_value()
             .bool_value
+        )
+        mission_verbose_log = (
+            self.get_parameter("mission_verbose_log").get_parameter_value().bool_value
+        )
+        status_log_interval_sec = max(
+            0.3,
+            self.get_parameter("status_log_interval_sec")
+            .get_parameter_value()
+            .double_value,
         )
         align_px = (
             self.get_parameter("align_pixel_thresh").get_parameter_value().double_value
@@ -986,6 +1322,17 @@ class BearMissionHost(RosCommunicator):
         drop_at_home = (
             self.get_parameter("drop_at_home").get_parameter_value().bool_value
         )
+        align_home_heading_after_drop = (
+            self.get_parameter("align_home_heading_after_drop")
+            .get_parameter_value()
+            .bool_value
+        )
+        home_heading_align_timeout_sec = max(
+            3.0,
+            self.get_parameter("home_heading_align_timeout_sec")
+            .get_parameter_value()
+            .double_value,
+        )
         amcl_wait = (
             self.get_parameter("amcl_wait_timeout_sec").get_parameter_value().double_value
         )
@@ -1034,6 +1381,10 @@ class BearMissionHost(RosCommunicator):
             pose_msg = self.get_latest_amcl_pose()
             if pose_msg is not None:
                 home_pose = copy.deepcopy(pose_msg.pose.pose)
+                self.get_logger().info(
+                    f"Home pose recorded from '{amcl_topic}': "
+                    f"x={home_pose.position.x:.3f}, y={home_pose.position.y:.3f}"
+                )
                 break
             now = time.monotonic()
             if now - last_log >= 5.0:
@@ -1063,10 +1414,12 @@ class BearMissionHost(RosCommunicator):
             )
             arm.run_unity_vision_stow_blocking(unity_stow_elbow_deg)
 
-        # 實體車：任務開始前將手臂降至不遮擋相機的待機位置
+        # 實體車：任務開始前將手臂移至待機位置（與 COMMANDS.md 一致，夾爪打開）
         if not use_unity:
-            self.get_logger().info("實體車手臂初始化：降低手臂避免遮擋相機 …")
-            self.publish_robot_arm_angle([2.7, 1.5, 4.0])
+            self.get_logger().info(
+                "實體車手臂初始化：待機 [3.67, 0.5, 4.0]（shoulder, elbow, gripper open）…"
+            )
+            self.publish_robot_arm_angle([3.67, 0.5, 4.0])
             time.sleep(2.0)
 
         # 距離分區定義（公尺）
@@ -1076,12 +1429,19 @@ class BearMissionHost(RosCommunicator):
         #  dist <= grasp_zone: 主動煞車後停下 → 夾取
         zone_far  = 1.50
         zone_mid  = 0.80
-        zone_slow = grasp_trigger_dist_m  # 預設 0.65
+        zone_slow = grasp_trigger_dist_m  # 預設 0.40
+        grasp_commit_dist_raw = (
+            self.get_parameter("grasp_commit_dist_m").get_parameter_value().double_value
+        )
+        grasp_commit_dist_m = (
+            max(zone_slow + 0.12, grasp_commit_dist_raw)
+            if grasp_commit_dist_raw > 0.0
+            else max(zone_slow * 1.85, 0.55)
+        )
 
         self.get_logger().info(
-            "Approaching bear with braking lookahead "
-            f"(stop={approach_stop_dist_m:.2f}m, decel={approach_decel_mps2:.2f}m/s², "
-            f"grasp_zone={zone_slow:.2f}m) …"
+            "Approaching bear at full speed "
+            f"(stop={approach_stop_dist_m:.2f}m, grasp_zone={zone_slow:.2f}m) …"
         )
 
         t_start = time.monotonic()
@@ -1102,6 +1462,7 @@ class BearMissionHost(RosCommunicator):
         last_approach_unstick_time = 0.0
         last_yolo_lost_motion_log = 0.0
         last_yolo_hold_log = 0.0
+        last_status_log = 0.0
         last_target_valid_time = 0.0
         held_ti = None
         approach_unstick_side = 1
@@ -1112,6 +1473,9 @@ class BearMissionHost(RosCommunicator):
             "last_yaw": None,
             "explore_until": 0.0,
             "logged_spin": False,
+            "back_until": 0.0,
+            "logged_back": False,
+            "back_attempts": 0,
         }
         # 連續幀確認：連續 N 幀在 grasp zone 才觸發
         grasp_close_frames = 0
@@ -1182,7 +1546,7 @@ class BearMissionHost(RosCommunicator):
 
             if in_hold:
                 now_hold = time.monotonic()
-                if now_hold - last_yolo_hold_log >= 1.0:
+                if mission_verbose_log and now_hold - last_yolo_hold_log >= 1.0:
                     hold_dist = (
                         float(held_ti[1])
                         if held_ti is not None and float(held_ti[1]) > 0.0
@@ -1197,18 +1561,58 @@ class BearMissionHost(RosCommunicator):
                     last_yolo_hold_log = now_hold
 
             if yolo_search_confirmed and yolo_search_state["phase"] == "idle":
-                yolo_search_state["phase"] = "spin"
-                yolo_search_state["accumulated_rad"] = 0.0
-                yolo_search_state["last_yaw"] = None
-                if not yolo_search_state["logged_spin"]:
-                    ccw_action, _ = self._spin_action_names(approach_yolo_search_spin_speed_tier)
-                    self.get_logger().info(
-                        "[approach/yolo_lost] target lost (confirmed) → in-place search "
-                        f"(1 circle={math.degrees(approach_yolo_lost_search_circle_rad):.0f}° "
-                        f"spin={ccw_action}, "
-                        f"then explore {approach_yolo_explore_forward_sec:.1f}s forward)"
+                close_lost = self._close_range_lost(
+                    last_valid_dist, grasp_commit_dist_m
+                )
+                if (
+                    close_lost
+                    and approach_yolo_lost_back_enabled
+                    and yolo_search_state["back_attempts"]
+                    < approach_yolo_lost_back_max_attempts
+                ):
+                    yolo_search_state["phase"] = "back_peek"
+                    yolo_search_state["back_until"] = (
+                        time.monotonic() + approach_yolo_lost_back_sec
                     )
-                    yolo_search_state["logged_spin"] = True
+                    if not yolo_search_state["logged_back"]:
+                        self.get_logger().info(
+                            "[approach/yolo_lost] target lost near grasp "
+                            f"(last_dist={last_valid_dist:.2f}m) → back up "
+                            f"{approach_yolo_lost_back_sec:.1f}s to reacquire "
+                            f"(attempt {yolo_search_state['back_attempts'] + 1}/"
+                            f"{approach_yolo_lost_back_max_attempts})"
+                        )
+                        yolo_search_state["logged_back"] = True
+                elif self._should_memory_grasp_commit(
+                    target_live=target_live,
+                    last_valid_dist=last_valid_dist,
+                    lost_frames=lost_frames,
+                    grasp_commit_dist_m=grasp_commit_dist_m,
+                    min_lost_frames=1,
+                    back_enabled=approach_yolo_lost_back_enabled,
+                    back_attempts=yolo_search_state["back_attempts"],
+                    back_max_attempts=approach_yolo_lost_back_max_attempts,
+                ):
+                    aligned = True
+                    self.get_logger().info(
+                        f"[approach] Memory grasp commit: last seen {last_valid_dist:.2f}m "
+                        f"(back attempts={yolo_search_state['back_attempts']}) → GRASP"
+                    )
+                    self.publish_car_control("STOP")
+                    break
+                else:
+                    yolo_search_state["phase"] = "spin"
+                    yolo_search_state["accumulated_rad"] = 0.0
+                    yolo_search_state["last_yaw"] = None
+                    if not yolo_search_state["logged_spin"]:
+                        ccw_action, _ = self._spin_action_names(approach_yolo_search_spin_speed_tier)
+                        self.get_logger().info(
+                            "[approach/yolo_lost] target lost (confirmed) → in-place search "
+                            f"(1 circle={math.degrees(approach_yolo_lost_search_circle_rad):.0f}° "
+                            f"spin={ccw_action}, "
+                            f"then explore {approach_yolo_explore_forward_sec:.1f}s forward)"
+                        )
+                        yolo_search_state["logged_spin"] = True
 
             # 從 hold data 或實時資料決定本幀的 detected/dist/raw_dx_fresh
             approach_ti = ti if target_live else held_ti
@@ -1243,7 +1647,7 @@ class BearMissionHost(RosCommunicator):
                     and time.monotonic() - last_turn_progress_time
                     > approach_turn_stuck_time_sec
                 ):
-                    turn_stuck_boost = 1.45
+                    turn_stuck_boost = 1.15
 
             # 記錄最後有效距離 + 估算接近速度（深度變化率）
             if target_live:
@@ -1314,7 +1718,7 @@ class BearMissionHost(RosCommunicator):
                 )
 
             d_eff = last_valid_dist if last_valid_dist is not None else 9.9
-            obs_scale_floor = self._obstacle_speed_scale_floor(d_eff, zone_far, zone_mid)
+            obs_scale_floor = 1.0
 
             obs_for_stuck = (
                 self._evaluate_obstacles(
@@ -1365,7 +1769,7 @@ class BearMissionHost(RosCommunicator):
                 # 卡住時若上次有效距離在夾取範圍內，直接夾取而非後退搜尋
                 if (
                     last_valid_dist is not None
-                    and last_valid_dist <= zone_slow * 1.6
+                    and last_valid_dist <= grasp_commit_dist_m
                 ):
                     aligned = True
                     self.get_logger().info(
@@ -1489,12 +1893,21 @@ class BearMissionHost(RosCommunicator):
                     self.publish_raw_car_control(
                         [yaw_w, -yaw_w, yaw_w, -yaw_w]
                     )
+                    last_status_log = self._log_status_if_due(
+                        last_status_log,
+                        status_log_interval_sec,
+                        (
+                            f"夾取準備｜最後對準｜"
+                            f"{self._turn_dir_cn(raw_dx_fresh, visual_servo_yaw_deadband_px)}｜"
+                            f"距離 {dist:.2f}m（偏差 {raw_dx_fresh:+.0f}px）"
+                        ),
+                    )
                     time.sleep(approach_dt)
                     continue
 
             # ── log（加快到 0.35 秒一次）──
             now_t = time.monotonic()
-            if use_approach and now_t - last_approach_log >= 0.35:
+            if mission_verbose_log and use_approach and now_t - last_approach_log >= 0.35:
                 d_eff_log = last_valid_dist if last_valid_dist is not None else dist
                 if d_eff_log is not None:
                     margin = max(0.0, d_eff_log - approach_stop_dist_m)
@@ -1526,9 +1939,9 @@ class BearMissionHost(RosCommunicator):
             # ── 行進速度：煞車距離前瞻 + 連續視覺轉向 + 障礙護欄 ──
             d = last_valid_dist if last_valid_dist is not None else 9.9
             approach_depth_hint = live_dist if target_live else last_valid_dist
+            approach_control_dx = None
 
             if not use_approach:
-                # YOLO 丟失確認 → 搜尋狀態機
                 obs_search = self._evaluate_obstacles(
                     dp,
                     obstacle_guard,
@@ -1543,8 +1956,55 @@ class BearMissionHost(RosCommunicator):
                     prefix="approach/obstacle",
                     dp=dp,
                     source_debug_enabled=obstacle_source_debug_enabled,
+                    emit_detail=mission_verbose_log,
                 )
-                if yolo_search_state["phase"] == "explore":
+                if yolo_search_state["phase"] == "back_peek":
+                    if time.monotonic() < yolo_search_state["back_until"]:
+                        self.publish_car_control("BACKWARD_SLOW")
+                    else:
+                        self.publish_car_control("STOP")
+                        yolo_search_state["back_attempts"] += 1
+                        yolo_search_state["phase"] = "idle"
+                        yolo_search_state["logged_back"] = False
+                        self.get_logger().info(
+                            "[approach/yolo_lost] back peek finished "
+                            f"(attempts={yolo_search_state['back_attempts']}/"
+                            f"{approach_yolo_lost_back_max_attempts}), "
+                            f"last_dist={last_valid_dist if last_valid_dist is not None else 'n/a'}m"
+                        )
+                        if self._should_memory_grasp_commit(
+                            target_live=target_live,
+                            last_valid_dist=last_valid_dist,
+                            lost_frames=lost_frames,
+                            grasp_commit_dist_m=grasp_commit_dist_m,
+                            min_lost_frames=1,
+                            back_enabled=approach_yolo_lost_back_enabled,
+                            back_attempts=yolo_search_state["back_attempts"],
+                            back_max_attempts=approach_yolo_lost_back_max_attempts,
+                        ):
+                            aligned = True
+                            self.get_logger().info(
+                                f"[approach] Back peek failed — memory grasp at "
+                                f"{last_valid_dist:.2f}m → GRASP"
+                            )
+                            break
+                elif self._should_memory_grasp_commit(
+                    target_live=target_live,
+                    last_valid_dist=last_valid_dist,
+                    lost_frames=lost_frames,
+                    grasp_commit_dist_m=grasp_commit_dist_m,
+                    min_lost_frames=1,
+                    back_enabled=approach_yolo_lost_back_enabled,
+                    back_attempts=yolo_search_state["back_attempts"],
+                    back_max_attempts=approach_yolo_lost_back_max_attempts,
+                ):
+                    aligned = True
+                    self.get_logger().info(
+                        f"[approach] Memory grasp at {last_valid_dist:.2f}m → GRASP"
+                    )
+                    self.publish_car_control("STOP")
+                    break
+                elif yolo_search_state["phase"] == "explore":
                     explore_cmd = [approach_yolo_explore_forward_speed] * 4
                     if obstacle_guard_enabled:
                         scaled = obstacle_guard.apply_to_wheel_cmd(
@@ -1556,7 +2016,7 @@ class BearMissionHost(RosCommunicator):
                         self.publish_raw_car_control(scaled)
                     else:
                         self.publish_car_control("FORWARD_SLOW")
-                else:
+                elif yolo_search_state["phase"] == "spin":
                     spin_action = self._pick_yolo_lost_spin_action(
                         obstacle_guard,
                         obs_search,
@@ -1567,8 +2027,10 @@ class BearMissionHost(RosCommunicator):
                         self.publish_car_control("STOP")
                     else:
                         self.publish_car_control(spin_action)
+                else:
+                    self.publish_car_control("STOP")
                 now_lost_log = time.monotonic()
-                if now_lost_log - last_yolo_lost_motion_log >= 0.5:
+                if mission_verbose_log and now_lost_log - last_yolo_lost_motion_log >= 0.5:
                     acc_deg = math.degrees(
                         float(yolo_search_state.get("accumulated_rad", 0.0))
                     )
@@ -1590,43 +2052,23 @@ class BearMissionHost(RosCommunicator):
                     )
                     last_yolo_lost_motion_log = now_lost_log
             else:
-                margin = max(0.0, d - approach_stop_dist_m)
-                fwd_wheel = self._lookahead_forward_wheel_speed(
-                    dist_m=d,
-                    closure_mps=closure_speed_mps,
-                    stop_m=approach_stop_dist_m,
-                    decel_mps2=approach_decel_mps2,
-                    safety_m=approach_brake_safety_m,
-                    max_wheel=visual_servo_max_forward_speed_far,
-                    max_mps=approach_max_speed_mps,
-                )
-                # 已對準且進入 pre-grasp 區：再压低前進上限
-                if (
+                fwd_wheel = visual_servo_max_forward_speed_far
+                center_first = (
                     use_approach
                     and dist > 0.0
-                    and dist <= zone_slow + 0.45
-                    and abs(raw_dx_fresh) <= align_px * 1.5
-                ):
-                    ramp = max(
-                        0.10,
-                        (dist - approach_stop_dist_m)
-                        / max(1e-3, zone_slow + 0.40 - approach_stop_dist_m),
-                    )
-                    fwd_wheel *= min(1.0, ramp ** 1.8)
-                center_first = (
-                    margin < (zone_mid - approach_stop_dist_m)
-                    or (
-                        use_approach
-                        and dist > 0.0
-                        and dist <= 1.05
-                        and abs(raw_dx_fresh) <= vs_center_deadband_px * 1.4
-                    )
+                    and dist <= 1.05
+                    and abs(raw_dx_fresh) <= vs_center_deadband_px * 1.4
                 )
                 yaw_cap = (
                     visual_servo_max_yaw_near
                     if center_first
                     else visual_servo_max_yaw_far
                 ) * turn_stuck_boost
+                nav_yolo_ti = (
+                    list(approach_ti)
+                    if use_approach and approach_ti is not None
+                    else None
+                )
                 wheel_cmd = nav.camera_nav_pid_command(
                     target_depth_m=approach_stop_dist_m,
                     search_spin_speed=visual_servo_search_spin_speed,
@@ -1646,19 +2088,26 @@ class BearMissionHost(RosCommunicator):
                     pixel_offset_bias_px=align_bias_px,
                     dx_ema_alpha=visual_servo_dx_ema_alpha,
                     depth_ema_alpha=visual_servo_depth_ema_alpha,
+                    near_grasp_slowdown_enabled=False,
+                    yolo_target_info=nav_yolo_ti,
                 )
+                control_dx = nav.get_filtered_dx_px()
+                if control_dx is None:
+                    control_dx = raw_dx_fresh - align_bias_px
+                approach_control_dx = control_dx
                 turn_dir = (
                     "←turn" if raw_dx < -visual_servo_yaw_deadband_px
                     else "→turn" if raw_dx > visual_servo_yaw_deadband_px
                     else "straight"
                 )
                 zone_name = self._approach_zone_name(d, zone_far, zone_mid)
-                self.get_logger().info(
-                    f"[approach/action] {zone_name} {turn_dir} "
-                    f"dist={d:.2f}m dx={raw_dx:.0f}px fwd={fwd_wheel:.0f} "
-                    f"yaw_cap={yaw_cap:.0f} center_first={center_first} "
-                    f"target={'live' if target_live else 'held' if held_ti else 'lost'}"
-                )
+                if mission_verbose_log:
+                    self.get_logger().info(
+                        f"[approach/action] {zone_name} {turn_dir} "
+                        f"dist={d:.2f}m dx={raw_dx:.0f}px fwd={fwd_wheel:.0f} "
+                        f"yaw_cap={yaw_cap:.0f} center_first={center_first} "
+                        f"target={'live' if target_live else 'held' if held_ti else 'lost'}"
+                    )
                 last_obstacle_log = self._apply_obstacle_motion(
                     dp,
                     obstacle_guard,
@@ -1672,7 +2121,36 @@ class BearMissionHost(RosCommunicator):
                     approach_mode=True,
                     speed_scale_floor=obs_scale_floor,
                     source_debug_enabled=obstacle_source_debug_enabled,
+                    emit_detail=mission_verbose_log,
                 )
+
+            status_obs = None
+            if obstacle_guard_enabled:
+                status_obs = obs_search if not use_approach else obs_for_stuck
+            status_control_dx = (
+                approach_control_dx
+                if approach_control_dx is not None
+                else (raw_dx_fresh - align_bias_px if use_approach else raw_dx)
+            )
+            last_status_log = self._log_status_if_due(
+                last_status_log,
+                status_log_interval_sec,
+                self._build_approach_status_cn(
+                    use_approach=use_approach,
+                    yolo_search_confirmed=yolo_search_confirmed,
+                    in_hold=in_hold,
+                    target_live=target_live,
+                    yolo_search_state=yolo_search_state,
+                    dist=dist,
+                    last_valid_dist=last_valid_dist,
+                    control_dx=status_control_dx,
+                    yolo_dx=(raw_dx_fresh if use_approach else None),
+                    deadband_px=visual_servo_yaw_deadband_px,
+                    zone_far=zone_far,
+                    zone_mid=zone_mid,
+                    obs=status_obs,
+                ),
+            )
 
             if not rclpy.ok():
                 break
@@ -1687,52 +2165,152 @@ class BearMissionHost(RosCommunicator):
             )
             return
 
-        self.get_logger().info("Waiting for /yolo/target_marker …")
-        t_m = time.monotonic()
-        while time.monotonic() - t_m < marker_wait and rclpy.ok():
-            if self.latest_yolo_marker is not None:
-                break
-            time.sleep(0.05)
+        # ── 最後補進：依熊最後被看到的距離與方向，補足剩餘間距後再夾 ──
+        if grasp_final_nudge_enabled and last_valid_dist is not None:
+            gap_m = max(0.08, min(0.30, last_valid_dist - approach_stop_dist_m))
+            # 先修正朝向（用最後鎖定的水平偏差）
+            if locked_dx is not None and abs(locked_dx) > visual_servo_yaw_deadband_px:
+                yaw_w = nav.compute_yaw_wheel_from_pixel(
+                    locked_dx,
+                    max_yaw_wheel=visual_servo_max_yaw_near * 0.55,
+                    deadband_px=visual_servo_yaw_deadband_px,
+                    soft_scale_px=visual_servo_yaw_soft_scale_px,
+                    dt=approach_dt,
+                )
+                self.publish_raw_car_control([yaw_w, -yaw_w, yaw_w, -yaw_w])
+                time.sleep(0.20)
+                self.publish_car_control("STOP")
+                time.sleep(0.12)
+            # wheel_speed 130 ≈ 0.15 m/s（保守估算）
+            nudge_sec = max(
+                grasp_final_nudge_min_sec,
+                min(grasp_final_nudge_max_sec, gap_m / 0.15),
+            )
+            self.get_logger().info(
+                f"[grasp prep] Memory grasp: last seen {last_valid_dist:.2f}m — "
+                f"nudge forward {gap_m:.2f}m ({nudge_sec:.1f}s, "
+                f"speed={grasp_final_nudge_wheel_speed:.0f}) → close gripper"
+            )
+            self.publish_raw_car_control([grasp_final_nudge_wheel_speed] * 4)
+            time.sleep(nudge_sec)
+            self.publish_car_control("STOP")
+            time.sleep(0.35)
+
+        if not use_unity:
+            self.get_logger().info("[grasp prep] Real robot: skip marker wait, grasp now.")
+        else:
+            self.get_logger().info("Waiting for /yolo/target_marker …")
+            t_m = time.monotonic()
+            while time.monotonic() - t_m < marker_wait and rclpy.ok():
+                if self.latest_yolo_marker is not None:
+                    break
+                time.sleep(0.05)
 
         ok = arm.run_grasp_blocking()
         if not ok:
             self.get_logger().error("Grasp failed.")
             return
 
-        # ── odom-based 回程（不需要 AMCL / Nav2 / 地圖）──
-        if home_odom is not None:
-            self.get_logger().info("開始 odom-based 回起點導航 …")
-            self._navigate_home_odom(home_odom, timeout=90.0)
-            self.get_logger().info("Odom 回程完成，任務結束。")
-            return
-
-        if home_pose is None:
-            self.get_logger().info("home_pose 未記錄，跳過回起點。任務完成。")
-            return
-
-        if not _NAV2_AVAILABLE:
-            self.get_logger().warn("nav2_msgs 未安裝，跳過 NavigateToPose 回起點。任務完成。")
-            return
-
-        current_pose_msg = self.get_latest_amcl_pose()
-        if current_pose_msg is not None:
-            d_before = self._dist_xy(current_pose_msg.pose.pose, home_pose)
-            self.get_logger().info(f"Navigating home … (current→home distance={d_before:.3f}m)")
-            if d_before <= home_reached_thresh:
+        # ── 回程：有 AMCL home + Nav2 時走 map 導航，否則 fallback odom ──
+        if home_pose is None or not _NAV2_AVAILABLE:
+            if home_pose is not None and not _NAV2_AVAILABLE:
                 self.get_logger().warn(
-                    f"Current distance to home is already small ({d_before:.3f}m <= {home_reached_thresh:.3f}m). "
-                    "Mission may appear to 'not move'."
+                    "nav2_msgs 未安裝，無法使用 NavigateToPose，改試 odom 回程。"
                 )
-        else:
-            d_before = None
-            self.get_logger().info("Navigating home …")
-        goal_pose = PoseStamped()
-        goal_pose.header.frame_id = "map"
-        goal_pose.header.stamp = self.get_clock().now().to_msg()
-        goal_pose.pose = copy.deepcopy(home_pose)
+            if home_odom is not None:
+                self.get_logger().info(
+                    "開始 odom-based 回起點導航（面向起點前進，到站放下後對正起始朝向）…"
+                )
+                odom_arrived = self._navigate_home_odom(
+                    home_odom,
+                    timeout=90.0,
+                    arrive_thresh=home_reached_thresh,
+                )
+                if not odom_arrived:
+                    self.get_logger().warn("Odom 回程未到達起點附近。")
+                self._finish_at_home(
+                    arm=arm,
+                    home_pose=home_odom,
+                    drop_at_home=drop_at_home,
+                    arrival_thresh_m=home_reached_thresh,
+                    align_after_drop=align_home_heading_after_drop,
+                    heading_thresh_deg=fallback_heading_thresh_deg,
+                    rotate_step_sec=fallback_rotate_step_sec,
+                    align_timeout_sec=home_heading_align_timeout_sec,
+                    use_odom=True,
+                )
+            else:
+                self.get_logger().info("home_pose 未記錄且無 odom home，跳過回起點。任務完成。")
+            return
 
-        nav_goal = NavigateToPose.Goal()
-        nav_goal.pose = goal_pose
+        self.get_logger().info("開始 Nav2 + AMCL map 回程 …")
+        d_before = self._home_dist_from_amcl(home_pose)
+        if d_before is not None:
+            self.get_logger().info(
+                f"Navigating home … (current→home distance={d_before:.3f}m)"
+            )
+        else:
+            self.get_logger().info("Navigating home … (AMCL pose unavailable)")
+
+        if d_before is not None and d_before <= home_reached_thresh:
+            self.get_logger().info(
+                f"Already at home ({d_before:.3f}m <= {home_reached_thresh:.3f}m) "
+                "— skip Nav2, release directly."
+            )
+            self._finish_at_home(
+                arm=arm,
+                home_pose=home_pose,
+                drop_at_home=drop_at_home,
+                arrival_thresh_m=home_reached_thresh,
+                align_after_drop=align_home_heading_after_drop,
+                heading_thresh_deg=fallback_heading_thresh_deg,
+                rotate_step_sec=fallback_rotate_step_sec,
+                align_timeout_sec=home_heading_align_timeout_sec,
+                use_odom=False,
+                nav_succeeded=True,
+                nav_status=GoalStatus.STATUS_SUCCEEDED,
+                nav_status_text=self._GOAL_STATUS_TEXT[GoalStatus.STATUS_SUCCEEDED],
+            )
+            return
+
+        bt_active = self._is_bt_navigator_active()
+        if bt_active is False:
+            self._log_nav2_inactive_help()
+            if fallback_home_enabled:
+                self.get_logger().warn(
+                    "[nav] bt_navigator inactive — fallback to AMCL drive home."
+                )
+                fallback_ok = self._fallback_drive_home(
+                    home_pose=home_pose,
+                    timeout_sec=fallback_home_timeout_sec,
+                    arrival_xy_thresh_m=fallback_arrival_xy_thresh_m,
+                    heading_thresh_deg=fallback_heading_thresh_deg,
+                    rotate_step_sec=fallback_rotate_step_sec,
+                    forward_step_sec=fallback_forward_step_sec,
+                )
+                self._finish_at_home(
+                    arm=arm,
+                    home_pose=home_pose,
+                    drop_at_home=drop_at_home,
+                    arrival_thresh_m=home_reached_thresh,
+                    align_after_drop=align_home_heading_after_drop,
+                    heading_thresh_deg=fallback_heading_thresh_deg,
+                    rotate_step_sec=fallback_rotate_step_sec,
+                    align_timeout_sec=home_heading_align_timeout_sec,
+                    use_odom=False,
+                    nav_succeeded=fallback_ok,
+                    nav_status=(
+                        GoalStatus.STATUS_SUCCEEDED
+                        if fallback_ok
+                        else GoalStatus.STATUS_ABORTED
+                    ),
+                    nav_status_text=(
+                        self._GOAL_STATUS_TEXT[GoalStatus.STATUS_SUCCEEDED]
+                        if fallback_ok
+                        else self._GOAL_STATUS_TEXT[GoalStatus.STATUS_ABORTED]
+                    ),
+                )
+                return
 
         client: ActionClient = self.navigate_to_pose_action_client
         if not client.wait_for_server(timeout_sec=15.0):
@@ -1742,13 +2320,27 @@ class BearMissionHost(RosCommunicator):
         nav_succeeded = False
         status = GoalStatus.STATUS_UNKNOWN
         for attempt in range(nav_retry_count + 1):
+            nav_start_pose = self.get_latest_amcl_pose()
+            from_pose = self._geometry_pose_from_amcl_msg(nav_start_pose)
+            if from_pose is None:
+                self.get_logger().warn(
+                    "[nav] No AMCL pose for approach heading — using recorded home orientation."
+                )
+                from_pose = copy.deepcopy(home_pose)
+            goal_pose = self._make_nav_home_goal_pose(home_pose, from_pose)
+            approach_yaw = self._yaw_from_quat(goal_pose.pose.orientation)
+            home_yaw = self._yaw_from_quat(home_pose.orientation)
             self.get_logger().info(
-                f"[nav] Attempt {attempt + 1}/{nav_retry_count + 1}: sending NavigateToPose goal."
+                f"[nav] Attempt {attempt + 1}/{nav_retry_count + 1}: "
+                f"NavigateToPose goal approach_yaw={math.degrees(approach_yaw):.1f}° "
+                f"(face toward home), post-drop home_yaw={math.degrees(home_yaw):.1f}°"
             )
+            nav_goal = NavigateToPose.Goal()
+            nav_goal.pose = goal_pose
             send_future = client.send_goal_async(
                 nav_goal,
-                feedback_callback=lambda fb, _self=self, _period=nav_feedback_log_sec: _self._nav_feedback_cb(
-                    fb, _period
+                feedback_callback=lambda fb, _self=self, _period=nav_feedback_log_sec, _verbose=mission_verbose_log: _self._nav_feedback_cb(
+                    fb, _period, verbose=_verbose
                 ),
             )
             t_nav = time.monotonic()
@@ -1761,7 +2353,19 @@ class BearMissionHost(RosCommunicator):
             else:
                 goal_handle = send_future.result()
                 if not goal_handle.accepted:
-                    self.get_logger().error("[nav] Goal rejected by NavigateToPose server.")
+                    d_reject = self._home_dist_from_amcl(home_pose)
+                    if (
+                        d_reject is not None
+                        and d_reject <= home_reached_thresh
+                    ):
+                        self.get_logger().warn(
+                            f"[nav] Goal rejected but already at home "
+                            f"({d_reject:.3f}m) — skip Nav2 retry/unstick, release."
+                        )
+                        nav_succeeded = True
+                        status = GoalStatus.STATUS_SUCCEEDED
+                        break
+                    self._log_nav2_inactive_help()
                     status = GoalStatus.STATUS_UNKNOWN
                 else:
                     self._last_nav_feedback_distance = None
@@ -1772,6 +2376,8 @@ class BearMissionHost(RosCommunicator):
                     t_nav = time.monotonic()
                     last_nav_obstacle_log = 0.0
                     last_nav_obstacle_check = 0.0
+                    last_nav_status_log = 0.0
+                    obs_nav = None
                     nav_aborted_by_guard = False
                     while not result_future.done() and time.monotonic() - t_nav < nav_timeout:
                         now_nav = time.monotonic()
@@ -1786,6 +2392,7 @@ class BearMissionHost(RosCommunicator):
                                 last_nav_obstacle_log,
                                 obstacle_log_interval,
                                 prefix="nav/obstacle",
+                                emit_detail=mission_verbose_log,
                             )
                             if obs_nav.front_clearance_m < nav_obstacle_stop_m:
                                 self.get_logger().warn(
@@ -1816,6 +2423,18 @@ class BearMissionHost(RosCommunicator):
                                 or (prev_home - d_home_now) >= self._nav_stuck_min_progress_m
                             ):
                                 self._last_nav_progress_time = time.monotonic()
+
+                        last_nav_status_log = self._log_status_if_due(
+                            last_nav_status_log,
+                            status_log_interval_sec,
+                            self._build_nav_status_cn(
+                                attempt=attempt + 1,
+                                attempt_total=nav_retry_count + 1,
+                                home_dist=self._last_home_dist,
+                                nav_feedback_dist=self._last_nav_feedback_distance,
+                                obs=obs_nav,
+                            ),
+                        )
 
                         # 若長時間幾乎無進展，主動取消本次導航，交給 retry 流程
                         if (
@@ -1864,6 +2483,16 @@ class BearMissionHost(RosCommunicator):
             if nav_succeeded:
                 break
 
+            d_retry = self._home_dist_from_amcl(home_pose)
+            if d_retry is not None and d_retry <= home_reached_thresh:
+                self.get_logger().warn(
+                    f"[nav] Nav failed but already at home ({d_retry:.3f}m) "
+                    "— skip retry/unstick, release."
+                )
+                nav_succeeded = True
+                status = GoalStatus.STATUS_SUCCEEDED
+                break
+
             if attempt < nav_retry_count:
                 self.get_logger().warn(
                     "[nav] Attempt failed. Clearing costmaps and retrying once pose is updated."
@@ -1892,6 +2521,12 @@ class BearMissionHost(RosCommunicator):
             and (not nav_succeeded)
             and (d_after is None or d_after > home_reached_thresh)
         )
+        need_final_approach = (
+            fallback_home_enabled
+            and nav_succeeded
+            and d_after is not None
+            and d_after > home_reached_thresh
+        )
         if need_fallback:
             if nav_feedback_inconsistent:
                 self.get_logger().warn(
@@ -1917,6 +2552,30 @@ class BearMissionHost(RosCommunicator):
             else:
                 self.get_logger().warn("[fallback] Home fallback failed or timed out.")
 
+        if need_final_approach:
+            self.get_logger().warn(
+                f"[nav] Nav2 SUCCEEDED but AMCL still {d_after:.3f}m from home "
+                f"(threshold={home_reached_thresh:.3f}m) — final approach to release zone."
+            )
+            final_ok = self._fallback_drive_home(
+                home_pose=home_pose,
+                timeout_sec=min(fallback_home_timeout_sec, 15.0),
+                arrival_xy_thresh_m=home_reached_thresh,
+                heading_thresh_deg=fallback_heading_thresh_deg,
+                rotate_step_sec=fallback_rotate_step_sec,
+                forward_step_sec=fallback_forward_step_sec,
+            )
+            if final_ok:
+                self.get_logger().info("[nav] Final approach reached release zone.")
+            else:
+                self.get_logger().warn(
+                    "[nav] Final approach did not reach release zone; "
+                    "will check distance again before release."
+                )
+            current_pose_msg = self.get_latest_amcl_pose()
+            if current_pose_msg is not None:
+                d_after = self._dist_xy(current_pose_msg.pose.pose, home_pose)
+
         current_pose_msg = self.get_latest_amcl_pose()
         if current_pose_msg is not None:
             d_after = self._dist_xy(current_pose_msg.pose.pose, home_pose)
@@ -1924,25 +2583,21 @@ class BearMissionHost(RosCommunicator):
         else:
             d_after = None
 
-        # 僅在「導航成功」或「確實已回到 home 附近」時放下，避免原地誤判。
-        close_to_home = d_after is not None and d_after <= home_reached_thresh
-        # 安全起見：只有「確實接近 home」才放下；僅有 SUCCEEDED 不足以判定已到位
-        can_release = close_to_home
-        if drop_at_home and can_release:
-            self.get_logger().info("Releasing target at home …")
-            released = arm.run_release_blocking()
-            if not released:
-                self.get_logger().warn("Release sequence failed or interrupted.")
-        elif drop_at_home:
-            status_text = self._GOAL_STATUS_TEXT.get(status, f"UNKNOWN_CODE({status})")
-            self.get_logger().warn(
-                "Skip release: robot is not close enough to home "
-                f"(distance={d_after if d_after is not None else 'unknown'}m, "
-                f"threshold={home_reached_thresh:.3f}m, "
-                f"nav_succeeded={nav_succeeded}, nav_status={status} [{status_text}])."
-            )
-        else:
-            self.get_logger().info("drop_at_home=false, skip release.")
+        status_text = self._GOAL_STATUS_TEXT.get(status, f"UNKNOWN_CODE({status})")
+        self._finish_at_home(
+            arm=arm,
+            home_pose=home_pose,
+            drop_at_home=drop_at_home,
+            arrival_thresh_m=home_reached_thresh,
+            align_after_drop=align_home_heading_after_drop,
+            heading_thresh_deg=fallback_heading_thresh_deg,
+            rotate_step_sec=fallback_rotate_step_sec,
+            align_timeout_sec=home_heading_align_timeout_sec,
+            use_odom=False,
+            nav_succeeded=nav_succeeded,
+            nav_status=status,
+            nav_status_text=status_text,
+        )
 
     def _clear_costmaps_once(self):
         try:
@@ -1983,7 +2638,7 @@ class BearMissionHost(RosCommunicator):
         except Exception as e:
             self.get_logger().warn(f"[nav] _clear_costmaps_once unexpected error: {e}")
 
-    def _nav_feedback_cb(self, feedback_msg, log_period_sec: float):
+    def _nav_feedback_cb(self, feedback_msg, log_period_sec: float, verbose: bool = False):
         now = time.monotonic()
         fb = feedback_msg.feedback
         dist_rem = getattr(fb, "distance_remaining", None)
@@ -1993,6 +2648,8 @@ class BearMissionHost(RosCommunicator):
             self._last_nav_feedback_time = now
             if prev is None or (prev - float(dist_rem)) >= self._nav_stuck_min_progress_m:
                 self._last_nav_progress_time = now
+        if not verbose:
+            return
         last = getattr(self, "_last_nav_feedback_log_time", 0.0)
         if now - last < log_period_sec:
             return
@@ -2154,6 +2811,171 @@ class BearMissionHost(RosCommunicator):
         self.publish_car_control("STOP")
         time.sleep(0.15)
 
+    @staticmethod
+    def _geometry_pose_from_amcl_msg(msg):
+        """PoseWithCovarianceStamped → geometry_msgs/Pose."""
+        if msg is None:
+            return None
+        inner = msg.pose
+        if hasattr(inner, "position"):
+            return inner
+        return inner.pose
+
+    @staticmethod
+    def _yaw_to_quaternion(yaw: float) -> Quaternion:
+        q = Quaternion()
+        q.z = math.sin(yaw / 2.0)
+        q.w = math.cos(yaw / 2.0)
+        return q
+
+    @staticmethod
+    def _approach_yaw_to_home(from_pose, home_pose) -> float:
+        dx = float(home_pose.position.x - from_pose.position.x)
+        dy = float(home_pose.position.y - from_pose.position.y)
+        if math.hypot(dx, dy) < 0.08:
+            return BearMissionHost._yaw_from_quat(home_pose.orientation)
+        return math.atan2(dy, dx)
+
+    def _make_nav_home_goal_pose(self, home_pose, from_pose) -> PoseStamped:
+        """Nav2 goal: home position + yaw facing toward home (not final home heading)."""
+        goal_pose = PoseStamped()
+        goal_pose.header.frame_id = "map"
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.pose.position = copy.deepcopy(home_pose.position)
+        approach_yaw = self._approach_yaw_to_home(from_pose, home_pose)
+        goal_pose.pose.orientation = self._yaw_to_quaternion(approach_yaw)
+        return goal_pose
+
+    def _dist_to_home_pose(self, pose, home_pose) -> float | None:
+        if pose is None or home_pose is None:
+            return None
+        return self._dist_xy(pose, home_pose)
+
+    def _align_to_home_yaw(
+        self,
+        home_pose,
+        heading_thresh_deg: float,
+        rotate_step_sec: float,
+        timeout_sec: float,
+        use_odom: bool = False,
+    ) -> bool:
+        """Rotate in place to match recorded home orientation after drop."""
+        heading_thresh = math.radians(heading_thresh_deg)
+        home_yaw = self._yaw_from_quat(home_pose.orientation)
+        t0 = time.monotonic()
+        last_log = 0.0
+        self.get_logger().info(
+            f"[home] 對正起始朝向 target={math.degrees(home_yaw):.1f}° …"
+        )
+        while rclpy.ok() and time.monotonic() - t0 < timeout_sec:
+            if not rclpy.ok():
+                break
+            if use_odom:
+                odom = self.get_latest_odom()
+                if odom is None:
+                    time.sleep(0.05)
+                    continue
+                curr_yaw = self._yaw_from_quat(odom.pose.pose.orientation)
+            else:
+                amcl_pose_msg = self.get_latest_amcl_pose()
+                if amcl_pose_msg is None:
+                    time.sleep(0.05)
+                    continue
+                curr_yaw = self._yaw_from_quat(amcl_pose_msg.pose.pose.orientation)
+
+            yaw_err = self._normalize_angle(home_yaw - curr_yaw)
+            now = time.monotonic()
+            if now - last_log >= 1.0:
+                self.get_logger().info(
+                    f"[狀態] 回程完成｜對正起始朝向｜"
+                    f"剩餘 {math.degrees(yaw_err):+.1f}°"
+                )
+                last_log = now
+
+            if abs(yaw_err) <= heading_thresh:
+                self.publish_car_control("STOP")
+                self.get_logger().info(
+                    f"[home] 起始朝向已對正（誤差 {math.degrees(yaw_err):+.1f}°）。"
+                )
+                return True
+
+            self.publish_car_control(
+                "COUNTERCLOCKWISE_ROTATION"
+                if yaw_err > 0.0
+                else "CLOCKWISE_ROTATION"
+            )
+            time.sleep(rotate_step_sec)
+            self.publish_car_control("STOP")
+            time.sleep(0.03)
+
+        self.publish_car_control("STOP")
+        self.get_logger().warn("[home] 對正起始朝向 timeout。")
+        return False
+
+    def _finish_at_home(
+        self,
+        arm,
+        home_pose,
+        drop_at_home: bool,
+        arrival_thresh_m: float,
+        align_after_drop: bool,
+        heading_thresh_deg: float,
+        rotate_step_sec: float,
+        align_timeout_sec: float,
+        use_odom: bool = False,
+        nav_succeeded: bool | None = None,
+        nav_status: int | None = None,
+        nav_status_text: str | None = None,
+    ) -> None:
+        if use_odom:
+            odom = self.get_latest_odom()
+            current_pose = odom.pose.pose if odom is not None else None
+        else:
+            amcl_pose_msg = self.get_latest_amcl_pose()
+            current_pose = (
+                amcl_pose_msg.pose.pose if amcl_pose_msg is not None else None
+            )
+
+        d_after = self._dist_to_home_pose(current_pose, home_pose)
+        if current_pose is not None and d_after is not None:
+            self.get_logger().info(f"After nav, current→home distance={d_after:.3f}m")
+
+        close_to_home = d_after is not None and d_after <= arrival_thresh_m
+        if drop_at_home and close_to_home:
+            self.get_logger().info("[狀態] 回程完成｜到達起點｜放下目標 …")
+            self.get_logger().info("Releasing target at home …")
+            released = arm.run_release_blocking()
+            if not released:
+                self.get_logger().warn("Release sequence failed or interrupted.")
+        elif drop_at_home:
+            status_part = ""
+            if nav_status is not None:
+                status_part = (
+                    f", nav_succeeded={nav_succeeded}, "
+                    f"nav_status={nav_status} [{nav_status_text}]"
+                )
+            self.get_logger().warn(
+                "Skip release: robot is not close enough to home "
+                f"(distance={d_after if d_after is not None else 'unknown'}m, "
+                f"threshold={arrival_thresh_m:.3f}m{status_part})."
+            )
+            return
+        elif not drop_at_home:
+            self.get_logger().info("drop_at_home=false, skip release.")
+
+        if align_after_drop and close_to_home:
+            self._align_to_home_yaw(
+                home_pose=home_pose,
+                heading_thresh_deg=heading_thresh_deg,
+                rotate_step_sec=rotate_step_sec,
+                timeout_sec=align_timeout_sec,
+                use_odom=use_odom,
+            )
+        elif align_after_drop:
+            self.get_logger().warn(
+                "Skip heading align: robot is not close enough to home."
+            )
+
     def _fallback_drive_home(
         self,
         home_pose,
@@ -2167,13 +2989,11 @@ class BearMissionHost(RosCommunicator):
         當 Nav2 異常時，用 AMCL 做簡單閉迴路回家：
         1) 面向 home 方向
         2) 前進直到進入 home 半徑
-        3) 最後對齊 home 原始朝向
+        放下與對正起始朝向由 _finish_at_home() 負責。
         """
         heading_thresh = math.radians(heading_thresh_deg)
-        home_yaw = self._yaw_from_quat(home_pose.orientation)
         t0 = time.monotonic()
         last_log = 0.0
-        phase = "goto"
         while rclpy.ok() and time.monotonic() - t0 < timeout_sec:
             amcl_pose_msg = self.get_latest_amcl_pose()
             if amcl_pose_msg is None:
@@ -2189,28 +3009,18 @@ class BearMissionHost(RosCommunicator):
             now = time.monotonic()
             if now - last_log >= 1.0:
                 self.get_logger().info(
-                    f"[fallback] phase={phase}, dist={dist:.3f}m, "
-                    f"yaw={math.degrees(curr_yaw):.1f}deg"
+                    f"[fallback] dist={dist:.3f}m, yaw={math.degrees(curr_yaw):.1f}°"
                 )
                 last_log = now
 
             if dist <= arrival_xy_thresh_m:
-                phase = "final_heading"
-                yaw_err = self._normalize_angle(home_yaw - curr_yaw)
-                if abs(yaw_err) <= heading_thresh:
-                    self.publish_car_control("STOP")
-                    return True
-                self.publish_car_control(
-                    "COUNTERCLOCKWISE_ROTATION"
-                    if yaw_err > 0.0
-                    else "CLOCKWISE_ROTATION"
-                )
-                time.sleep(rotate_step_sec)
                 self.publish_car_control("STOP")
-                time.sleep(0.03)
-                continue
+                self.get_logger().info(
+                    f"[fallback] Arrived within {dist:.3f}m — "
+                    "hand off to drop + heading align."
+                )
+                return True
 
-            phase = "goto"
             heading_to_home = math.atan2(dy, dx)
             heading_err = self._normalize_angle(heading_to_home - curr_yaw)
             if abs(heading_err) > heading_thresh:
@@ -2229,19 +3039,24 @@ class BearMissionHost(RosCommunicator):
         self.publish_car_control("STOP")
         return False
 
-    def _navigate_home_odom(self, home_pose, timeout=90.0, arrive_thresh=0.25, heading_thresh=0.25):
+    def _navigate_home_odom(
+        self,
+        home_pose,
+        timeout=90.0,
+        arrive_thresh=0.25,
+        heading_thresh=0.25,
+    ) -> bool:
         """
-        Odom-based 回程：不需要 AMCL / Nav2 / 地圖。
-        使用 /odom 位置做比例控制，旋轉對準→前進→到達後對正朝向。
+        Odom-based 回程：面向起點前進直到進入 arrival 半徑。
+        放下與對正起始朝向由 _finish_at_home() 負責。
         """
         t_start = time.monotonic()
         home_x = float(home_pose.position.x)
         home_y = float(home_pose.position.y)
-        home_yaw = self._yaw_from_quat(home_pose.orientation)
-        phase = "goto"  # goto → align
 
         self.get_logger().info(
-            f"[nav_odom] 目標: x={home_x:.3f}, y={home_y:.3f}, yaw={math.degrees(home_yaw):.1f}°"
+            f"[nav_odom] 目標位置: x={home_x:.3f}, y={home_y:.3f} "
+            f"(arrive_thresh={arrive_thresh:.2f}m)"
         )
 
         while time.monotonic() - t_start < timeout and rclpy.ok():
@@ -2259,42 +3074,36 @@ class BearMissionHost(RosCommunicator):
             dy = home_y - cur_y
             dist = math.hypot(dx, dy)
 
-            if phase == "goto":
-                if dist <= arrive_thresh:
-                    self.publish_car_control("STOP")
-                    phase = "align"
-                    continue
+            if dist <= arrive_thresh:
+                self.publish_car_control("STOP")
+                self.get_logger().info(
+                    f"[nav_odom] 到達起點附近 dist={dist:.2f}m — "
+                    "hand off to drop + heading align."
+                )
+                return True
 
-                target_yaw = math.atan2(dy, dx)
-                yaw_err = self._normalize_angle(target_yaw - cur_yaw)
+            target_yaw = math.atan2(dy, dx)
+            yaw_err = self._normalize_angle(target_yaw - cur_yaw)
 
-                # 大偏差先原地旋轉，小偏差邊走邊修正
-                if abs(yaw_err) > 0.45:
-                    angular_z = 0.9 * math.copysign(1.0, yaw_err)
-                    self.publish_raw_car_control([angular_z, -angular_z])
-                else:
-                    linear_x = min(0.20, dist * 0.5)
-                    angular_z = 1.0 * yaw_err
-                    self.publish_raw_car_control([linear_x, angular_z])
-
-                if int(time.monotonic() - t_start) % 3 == 0:
-                    self.get_logger().info(
-                        f"[nav_odom] dist={dist:.2f}m, yaw_err={math.degrees(yaw_err):.1f}°"
-                    )
-
-            elif phase == "align":
-                yaw_err = self._normalize_angle(home_yaw - cur_yaw)
-                if abs(yaw_err) <= heading_thresh:
-                    self.publish_car_control("STOP")
-                    self.get_logger().info("[nav_odom] 到達起點，朝向對正，任務完成。")
-                    return
-                angular_z = 0.7 * math.copysign(1.0, yaw_err)
+            # 大偏差先原地旋轉，小偏差邊走邊修正
+            if abs(yaw_err) > 0.45:
+                angular_z = 0.9 * math.copysign(1.0, yaw_err)
                 self.publish_raw_car_control([angular_z, -angular_z])
+            else:
+                linear_x = min(0.20, dist * 0.5)
+                angular_z = 1.0 * yaw_err
+                self.publish_raw_car_control([linear_x, angular_z])
+
+            if int(time.monotonic() - t_start) % 3 == 0:
+                self.get_logger().info(
+                    f"[nav_odom] dist={dist:.2f}m, yaw_err={math.degrees(yaw_err):.1f}°"
+                )
 
             time.sleep(0.05)
 
         self.publish_car_control("STOP")
         self.get_logger().warn("[nav_odom] 回程 timeout，停止。")
+        return False
 
     @staticmethod
     def _yaw_from_quat(q) -> float:

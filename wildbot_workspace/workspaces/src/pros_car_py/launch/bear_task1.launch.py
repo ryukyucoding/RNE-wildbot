@@ -94,6 +94,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "auto_start": True,
+                        "repeat_mission": True,
                         "auto_start_delay_sec": auto_delay,
                         "use_unity_camera_nav": use_unity_nav,
                         "amcl_wait_timeout_sec": amcl_wait,
