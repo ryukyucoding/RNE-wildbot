@@ -108,7 +108,7 @@ sleep 10 && docker restart compose-localization-1
 
 ```bash
 cd ~/RNE/wildbot_workspace
-./scripts/set_initial_pose.sh 0.17575664578382752 0.7008322376447543 -1.696
+./scripts/set_initial_pose.sh 0.410 3.261 -0.058
 ```
 
 > **座標更新方式**：機器人放好、AMCL 收斂後，跑一次 `./scripts/save_current_pose.sh`，
@@ -306,6 +306,39 @@ ros2 run pros_car_py push_mission --ros-args \
 ```
 
 流程：YOLO 靠近 → 進入收集區 → 前進夾住 → **Nav2 NavigateToPose 推回 home** → 退後找熊 → 夾起上抬**放開**得分
+
+---
+
+## ⬜ 長方形自動走行
+
+不需 AMCL / Nav2 / 地圖，只要硬體與 odom 有在跑。預設 **2.0m × 2.0m**（正方形）；可分別指定長、寬兩邊。
+
+```bash
+# Terminal 1：硬體
+cd ~/RNE/wildbot_workspace
+./scripts/00_start_all.sh
+
+# Terminal 2：wildbot 容器內
+docker exec -it wildbot bash
+cd /workspaces
+colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
+
+# 預設 2m × 2m
+ros2 run pros_car_py rectangle_drive
+
+# 長方形：長邊 2m、寬邊 1m（邊 1→3 走 2m，邊 2→4 走 1m）
+ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=2.0 -p width_m:=1.0
+
+# 小範圍測試
+ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=0.5 -p width_m:=0.3
+
+# 慣性仍過頭時，再調小 turn_deg（預設 85°，實際約接近 90°）
+ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=0.5 -p width_m:=0.3 -p turn_deg:=82.0
+```
+
+走行順序：前進 `length_m` → 右轉 `turn_deg` → 前進 `width_m` → 右轉 `turn_deg` → …。預設 `turn_deg:=85` 是為了補償停車慣性。Ctrl+C 會自動停車。
+
+轉彎脈衝等進階參數仍寫在 `pros_car_py/rectangle_drive_node.py`（`TURN_PULSE_SEC` 等），實車偏差大時改常數後重新 build。
 
 ---
 

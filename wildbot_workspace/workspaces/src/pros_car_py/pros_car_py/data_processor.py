@@ -11,8 +11,8 @@ RIGHT_LIDAR_INDICES = list(range(-45, -15))  # right lidar indices
 
 # Angle bins for obstacle guard (degrees, 0 = lidar forward)
 LIDAR_FRONT_HALF_ANGLE_DEG = 35.0
-LIDAR_SIDE_MIN_ANGLE_DEG = 38.0
-LIDAR_SIDE_MAX_ANGLE_DEG = 72.0
+LIDAR_SIDE_MIN_ANGLE_DEG = 35.0
+LIDAR_SIDE_MAX_ANGLE_DEG = 100.0
 # Scan hits with x < -REAR_AXLE_BEHIND_LIDAR_M (lidar frame) are rear-only, not forward.
 REAR_AXLE_BEHIND_LIDAR_M = 0.22
 LIDAR_REAR_MIN_ANGLE_DEG = 100.0

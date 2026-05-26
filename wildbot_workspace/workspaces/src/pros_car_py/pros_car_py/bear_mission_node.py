@@ -170,9 +170,9 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("approach_yolo_lost_grace_sec", 1.5)
         self.declare_parameter("approach_yolo_lost_min_frames", 12)
         self.declare_parameter("approach_yolo_search_spin_speed_tier", "slow")
-        self.declare_parameter("approach_yolo_lost_search_circle_rad", 6.283185307)
-        self.declare_parameter("approach_yolo_explore_forward_sec", 2.0)
+        self.declare_parameter("approach_yolo_explore_forward_sec", 3.0)
         self.declare_parameter("approach_yolo_explore_forward_speed", 180.0)
+        self.declare_parameter("approach_yolo_search_turn_deg", 30.0)
         self.declare_parameter("approach_yolo_lost_motion_log_sec", 2.0)
         self.declare_parameter("status_log_interval_sec", 1.0)
         self.declare_parameter("mission_verbose_log", False)
@@ -404,14 +404,20 @@ class BearMissionHost(RosCommunicator):
     ) -> str:
         obs_text = self._obstacle_summary_cn(obs) if obs is not None else "路徑暢通"
         if yolo_search_confirmed:
-            phase = yolo_search_state.get("phase", "spin")
+            phase = yolo_search_state.get("phase", "forward")
             if phase == "back_peek":
                 mode = "後退尋找"
-            elif phase == "explore":
-                mode = "前進探索"
-            else:
+            elif phase == "turn_right":
                 acc_deg = math.degrees(float(yolo_search_state.get("accumulated_rad", 0.0)))
-                mode = f"原地旋轉搜尋（已轉 {acc_deg:.0f}°）"
+                mode = f"右轉搜尋（已轉 {acc_deg:.0f}°）"
+            elif phase == "forward":
+                remain = max(
+                    0.0,
+                    float(yolo_search_state.get("forward_until", 0.0)) - time.monotonic(),
+                )
+                mode = f"直走探索（剩 {remain:.1f}s）"
+            else:
+                mode = "準備搜尋"
             dist_hint = (
                 f"，上次距離 {last_valid_dist:.2f}m"
                 if last_valid_dist is not None
@@ -472,8 +478,8 @@ class BearMissionHost(RosCommunicator):
         state["phase"] = "idle"
         state["accumulated_rad"] = 0.0
         state["last_yaw"] = None
-        state["explore_until"] = 0.0
-        state["logged_spin"] = False
+        state["forward_until"] = 0.0
+        state["logged_search"] = False
         state["back_until"] = 0.0
         state["logged_back"] = False
         state["back_attempts"] = 0
@@ -741,30 +747,41 @@ class BearMissionHost(RosCommunicator):
     def _side_obs_yaw_correction(
         dp: DataProcessor,
         guard: ObstacleGuard,
-        max_yaw: float = 60.0,
-    ) -> tuple[float, float | None, float | None]:
+        max_yaw: float = 45.0,
+        left_react_m: float = 0.28,   # 左側較不敏感（比賽從左側出發）
+        right_react_m: float = 0.45,
+        front_react_m: float = 0.40,  # 前方開始減速
+        front_stop_m: float = 0.20,   # 前方此距離內完全擋住前進
+        rear_react_m: float = 0.30,
+        rear_stop_m: float = 0.15,
+        max_fwd_wheel: float = 124.0,  # ≈ 0.15 m/s in OLD_MAX=450 scale
+    ) -> tuple[float, float, float, float | None, float | None, float | None, float | None]:
         """
-        LiDAR 左右扇區（38°–72°）→ 疊加在 visual servo 上的 yaw 補正。
-        正值 = 右轉（閃左側障礙），負值 = 左轉（閃右側障礙）。
-        前方扇區（±35°）不做判斷，讓 visual servo 自行控制。
-        Returns (yaw_correction, left_m, right_m).
+        LiDAR 左右側邊 + 前方 + 後方障礙補正。
+        Returns (yaw, fwd_wheel_delta, front_block_ratio, left_m, right_m, rear_m, front_m).
+        yaw > 0 = 右轉；fwd > 0 = 後方推前進；front_block_ratio 0→1 縮減前進速度。
         """
         try:
-            _, left_m, right_m = get_lidar_sector_minimums(dp)
+            front_m, left_m, right_m = get_lidar_sector_minimums(dp)
         except Exception:
-            return 0.0, None, None
+            front_m, left_m, right_m = None, None, None
 
-        slow_m = guard.slow_m
+        rear_m = get_lidar_rear_minimum(dp)
         stop_m = guard.stop_m
 
-        def _c(dist: float | None) -> float:
-            if dist is None or not math.isfinite(dist) or dist >= slow_m:
+        def _intensity(dist, react, stop):
+            if dist is None or not math.isfinite(dist) or dist >= react:
                 return 0.0
-            t = max(0.0, (dist - stop_m) / max(slow_m - stop_m, 0.01))
-            return max_yaw * (1.0 - t)
+            t = max(0.0, (dist - stop) / max(react - stop, 0.01))
+            return 1.0 - t
 
-        yaw = _c(left_m) - _c(right_m)
-        return yaw, left_m, right_m
+        yaw = (
+            max_yaw * _intensity(left_m, left_react_m, stop_m)
+            - max_yaw * _intensity(right_m, right_react_m, stop_m)
+        )
+        fwd = max_fwd_wheel * _intensity(rear_m, rear_react_m, rear_stop_m)
+        front_block = _intensity(front_m, front_react_m, front_stop_m)
+        return yaw, fwd, front_block, left_m, right_m, rear_m, front_m
 
     def _pick_unstick_lateral_key(
         self,
@@ -1146,12 +1163,6 @@ class BearMissionHost(RosCommunicator):
         )
         if approach_yolo_search_spin_speed_tier not in ("slow", "median", "fast", "full"):
             approach_yolo_search_spin_speed_tier = "slow"
-        approach_yolo_lost_search_circle_rad = max(
-            math.pi,
-            self.get_parameter("approach_yolo_lost_search_circle_rad")
-            .get_parameter_value()
-            .double_value,
-        )
         approach_yolo_explore_forward_sec = max(
             0.5,
             self.get_parameter("approach_yolo_explore_forward_sec")
@@ -1164,6 +1175,13 @@ class BearMissionHost(RosCommunicator):
             .get_parameter_value()
             .double_value,
         )
+        approach_yolo_search_turn_deg = max(
+            5.0,
+            self.get_parameter("approach_yolo_search_turn_deg")
+            .get_parameter_value()
+            .double_value,
+        )
+        approach_yolo_search_turn_rad = math.radians(approach_yolo_search_turn_deg)
         approach_yolo_lost_motion_log_sec = max(
             0.5,
             self.get_parameter("approach_yolo_lost_motion_log_sec")
@@ -1471,8 +1489,8 @@ class BearMissionHost(RosCommunicator):
             "phase": "idle",
             "accumulated_rad": 0.0,
             "last_yaw": None,
-            "explore_until": 0.0,
-            "logged_spin": False,
+            "forward_until": 0.0,
+            "logged_search": False,
             "back_until": 0.0,
             "logged_back": False,
             "back_attempts": 0,
@@ -1601,18 +1619,20 @@ class BearMissionHost(RosCommunicator):
                     self.publish_car_control("STOP")
                     break
                 else:
-                    yolo_search_state["phase"] = "spin"
+                    yolo_search_state["phase"] = "forward"
+                    yolo_search_state["forward_until"] = (
+                        time.monotonic() + approach_yolo_explore_forward_sec
+                    )
                     yolo_search_state["accumulated_rad"] = 0.0
                     yolo_search_state["last_yaw"] = None
-                    if not yolo_search_state["logged_spin"]:
-                        ccw_action, _ = self._spin_action_names(approach_yolo_search_spin_speed_tier)
+                    if not yolo_search_state["logged_search"]:
                         self.get_logger().info(
-                            "[approach/yolo_lost] target lost (confirmed) → in-place search "
-                            f"(1 circle={math.degrees(approach_yolo_lost_search_circle_rad):.0f}° "
-                            f"spin={ccw_action}, "
-                            f"then explore {approach_yolo_explore_forward_sec:.1f}s forward)"
+                            "[approach/yolo_lost] target lost (confirmed) → search loop: "
+                            f"forward {approach_yolo_explore_forward_sec:.1f}s, "
+                            f"then turn right {approach_yolo_search_turn_deg:.0f}° "
+                            "(repeat until reacquired)"
                         )
-                        yolo_search_state["logged_spin"] = True
+                        yolo_search_state["logged_search"] = True
 
             # 從 hold data 或實時資料決定本幀的 detected/dist/raw_dx_fresh
             approach_ti = ti if target_live else held_ti
@@ -1688,34 +1708,30 @@ class BearMissionHost(RosCommunicator):
                 motion_stuck_min_progress_m,
                 min_progress_yaw_rad=progress_yaw_rad,
             )
-            if yolo_search_confirmed and yolo_search_state["phase"] == "spin":
-                search_yaw_rad = self._track_yolo_search_yaw(
+            if yolo_search_confirmed and yolo_search_state["phase"] == "forward":
+                if time.monotonic() >= yolo_search_state["forward_until"]:
+                    yolo_search_state["phase"] = "turn_right"
+                    yolo_search_state["accumulated_rad"] = 0.0
+                    yolo_search_state["last_yaw"] = None
+                    self.get_logger().info(
+                        "[approach/yolo_lost] forward finished, no target → "
+                        f"turn right {approach_yolo_search_turn_deg:.0f}°"
+                    )
+            elif yolo_search_confirmed and yolo_search_state["phase"] == "turn_right":
+                turned_rad = self._track_yolo_search_yaw(
                     yolo_search_state, amcl_pose
                 )
-                if search_yaw_rad >= approach_yolo_lost_search_circle_rad:
-                    yolo_search_state["phase"] = "explore"
-                    yolo_search_state["explore_until"] = (
+                if turned_rad >= approach_yolo_search_turn_rad:
+                    yolo_search_state["phase"] = "forward"
+                    yolo_search_state["forward_until"] = (
                         time.monotonic() + approach_yolo_explore_forward_sec
                     )
                     yolo_search_state["accumulated_rad"] = 0.0
                     yolo_search_state["last_yaw"] = None
                     self.get_logger().info(
-                        "[approach/yolo_lost] full circle without target "
-                        f"({math.degrees(search_yaw_rad):.0f}°) → explore forward "
-                        f"{approach_yolo_explore_forward_sec:.1f}s"
+                        "[approach/yolo_lost] turn finished, still no target → "
+                        f"forward {approach_yolo_explore_forward_sec:.1f}s again"
                     )
-            elif (
-                yolo_search_confirmed
-                and yolo_search_state["phase"] == "explore"
-                and time.monotonic() >= yolo_search_state["explore_until"]
-            ):
-                yolo_search_state["phase"] = "spin"
-                yolo_search_state["accumulated_rad"] = 0.0
-                yolo_search_state["last_yaw"] = None
-                self.get_logger().info(
-                    "[approach/yolo_lost] explore finished, still no target "
-                    "→ search spin again"
-                )
 
             d_eff = last_valid_dist if last_valid_dist is not None else 9.9
             obs_scale_floor = 1.0
@@ -2004,7 +2020,7 @@ class BearMissionHost(RosCommunicator):
                     )
                     self.publish_car_control("STOP")
                     break
-                elif yolo_search_state["phase"] == "explore":
+                elif yolo_search_state["phase"] == "forward":
                     explore_cmd = [approach_yolo_explore_forward_speed] * 4
                     if obstacle_guard_enabled:
                         scaled = obstacle_guard.apply_to_wheel_cmd(
@@ -2016,17 +2032,15 @@ class BearMissionHost(RosCommunicator):
                         self.publish_raw_car_control(scaled)
                     else:
                         self.publish_car_control("FORWARD_SLOW")
-                elif yolo_search_state["phase"] == "spin":
-                    spin_action = self._pick_yolo_lost_spin_action(
-                        obstacle_guard,
-                        obs_search,
-                        locked_dx,
-                        spin_tier=approach_yolo_search_spin_speed_tier,
+                elif yolo_search_state["phase"] == "turn_right":
+                    _, cw = self._spin_action_names(approach_yolo_search_spin_speed_tier)
+                    turn_action = self._normalize_spin_action_tier(
+                        cw, approach_yolo_search_spin_speed_tier
                     )
-                    if spin_action == "STOP":
+                    if obs_search.block_cmd == "STOP" and obs_search.speed_scale <= 0.05:
                         self.publish_car_control("STOP")
                     else:
-                        self.publish_car_control(spin_action)
+                        self.publish_car_control(turn_action)
                 else:
                     self.publish_car_control("STOP")
                 now_lost_log = time.monotonic()
@@ -2034,11 +2048,17 @@ class BearMissionHost(RosCommunicator):
                     acc_deg = math.degrees(
                         float(yolo_search_state.get("accumulated_rad", 0.0))
                     )
-                    motion_label = (
-                        "explore_forward"
-                        if yolo_search_state["phase"] == "explore"
-                        else spin_action
-                    )
+                    if yolo_search_state["phase"] == "forward":
+                        remain = max(
+                            0.0,
+                            float(yolo_search_state.get("forward_until", 0.0))
+                            - now_lost_log,
+                        )
+                        motion_label = f"forward ({remain:.1f}s left)"
+                    elif yolo_search_state["phase"] == "turn_right":
+                        motion_label = f"turn_right ({acc_deg:.0f}°/{approach_yolo_search_turn_deg:.0f}°)"
+                    else:
+                        motion_label = yolo_search_state["phase"]
                     reason = (
                         f"lost_frames={lost_frames} last_dist="
                         f"{last_valid_dist:.2f}m" if last_valid_dist else "lost_frames={lost_frames}"
@@ -2108,21 +2128,39 @@ class BearMissionHost(RosCommunicator):
                         f"yaw_cap={yaw_cap:.0f} center_first={center_first} "
                         f"target={'live' if target_live else 'held' if held_ti else 'lost'}"
                     )
-                last_obstacle_log = self._apply_obstacle_motion(
-                    dp,
-                    obstacle_guard,
-                    obstacle_guard_enabled,
-                    obstacle_log_interval,
-                    last_obstacle_log,
-                    wheel_cmd=wheel_cmd,
-                    prefix="approach/obstacle",
-                    approach_target_depth_m=approach_depth_hint,
-                    prefer_visual_yaw=True,
-                    approach_mode=True,
-                    speed_scale_floor=obs_scale_floor,
-                    source_debug_enabled=obstacle_source_debug_enabled,
-                    emit_detail=mission_verbose_log,
-                )
+                if obstacle_guard_enabled:
+                    yaw_obs, fwd_obs, front_blk, lm, rm, bm, fm = (
+                        self._side_obs_yaw_correction(dp, obstacle_guard)
+                    )
+                    if abs(yaw_obs) > 2.0:
+                        wheel_cmd = [
+                            wheel_cmd[0] + yaw_obs, wheel_cmd[1] - yaw_obs,
+                            wheel_cmd[2] + yaw_obs, wheel_cmd[3] - yaw_obs,
+                        ]
+                    if fwd_obs > 1.0:
+                        wheel_cmd = [w + fwd_obs for w in wheel_cmd]
+                    if front_blk > 0.05:
+                        scale = max(0.0, 1.0 - front_blk)
+                        wheel_cmd = [w * scale for w in wheel_cmd]
+                    now_obs = time.monotonic()
+                    if now_obs - last_obstacle_log >= obstacle_log_interval:
+                        lm_s = f"{lm:.2f}m" if lm is not None else "n/a"
+                        rm_s = f"{rm:.2f}m" if rm is not None else "n/a"
+                        bm_s = f"{bm:.2f}m" if bm is not None else "n/a"
+                        fm_s = f"{fm:.2f}m" if fm is not None else "n/a"
+                        active = abs(yaw_obs) > 2.0 or fwd_obs > 1.0 or front_blk > 0.05
+                        if active:
+                            self.get_logger().info(
+                                f"[obs] ⚠ yaw={yaw_obs:+.1f} fwd={fwd_obs:.0f} "
+                                f"fblk={front_blk:.2f} "
+                                f"L={lm_s} R={rm_s} B={bm_s} F={fm_s}"
+                            )
+                        elif obstacle_source_debug_enabled:
+                            self.get_logger().info(
+                                f"[obs] clear L={lm_s} R={rm_s} B={bm_s} F={fm_s}"
+                            )
+                        last_obstacle_log = now_obs
+                self.publish_raw_car_control(wheel_cmd)
 
             status_obs = None
             if obstacle_guard_enabled:
@@ -2394,11 +2432,21 @@ class BearMissionHost(RosCommunicator):
                                 prefix="nav/obstacle",
                                 emit_detail=mission_verbose_log,
                             )
-                            if obs_nav.front_clearance_m < nav_obstacle_stop_m:
+                            front_blocked = obs_nav.front_clearance_m < nav_obstacle_stop_m
+                            side_front_squeeze = (
+                                min(obs_nav.sensor_left_m, obs_nav.sensor_right_m)
+                                < 0.45
+                                and obs_nav.sensor_front_m < 0.45
+                            )
+                            if front_blocked or side_front_squeeze:
+                                side_m = min(obs_nav.sensor_left_m, obs_nav.sensor_right_m)
+                                reason = (
+                                    f"front={obs_nav.front_clearance_m:.2f}m < {nav_obstacle_stop_m:.2f}m"
+                                    if front_blocked
+                                    else f"side={side_m:.2f}m + front={obs_nav.sensor_front_m:.2f}m both < {obstacle_guard.slow_m:.2f}m"
+                                )
                                 self.get_logger().warn(
-                                    f"[nav/obstacle] Front clearance "
-                                    f"{obs_nav.front_clearance_m:.2f}m < "
-                                    f"{nav_obstacle_stop_m:.2f}m — cancel Nav2 goal."
+                                    f"[nav/obstacle] {reason} — cancel Nav2 goal."
                                 )
                                 cancel_future = goal_handle.cancel_goal_async()
                                 t_cancel = time.monotonic()

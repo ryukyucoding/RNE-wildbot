@@ -24,6 +24,7 @@ setup(
             "robot_control = pros_car_py.main2:main",
             "bear_mission = pros_car_py.bear_mission_node:main",
             "push_mission = pros_car_py.push_mission_node:main",
+            "rectangle_drive = pros_car_py.rectangle_drive_node:main",
             "carC_reader = pros_car_py.carC_serial_reader:main",
             "carC_writer = pros_car_py.carC_serial_writer:main",
             "arm_reader = pros_car_py.arm_reader:main",
