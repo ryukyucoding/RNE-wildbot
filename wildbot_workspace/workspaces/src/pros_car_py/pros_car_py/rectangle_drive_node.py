@@ -26,10 +26,10 @@ from rclpy.executors import MultiThreadedExecutor
 from pros_car_py.ros_communicator import RosCommunicator
 
 # ── 預設參數（可用 ros-args 覆寫） ──
-DEFAULT_LENGTH_M = 2.0
-DEFAULT_WIDTH_M = 2.0
+DEFAULT_LENGTH_M = 0.85
+DEFAULT_WIDTH_M = 2.95
 # 實車慣性會多滑一點，預設少轉一點以補償（目標約 90° 時可設 85° 左右）
-DEFAULT_TURN_DEG = 85.0
+DEFAULT_TURN_DEG = 48.5
 TURN_TOLERANCE_DEG = 2.0
 FORWARD_ACTION = "FORWARD_SLOW"
 TURN_ACTION = "CLOCKWISE_ROTATION"
