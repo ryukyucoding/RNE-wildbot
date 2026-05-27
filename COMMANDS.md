@@ -311,7 +311,7 @@ ros2 run pros_car_py push_mission --ros-args \
 
 ## ⬜ 長方形自動走行
 
-不需 AMCL / Nav2 / 地圖，只要硬體與 odom 有在跑。預設 **2.0m × 2.0m**（正方形）；可分別指定長、寬兩邊。
+不需 AMCL / Nav2 / 地圖，只要硬體與 odom 有在跑。預設 **2.0m × 2.0m**（正方形）；可用 `length_m` / `width_m` 或 `side1_m`～`side4_m` 指定各邊。
 
 ```bash
 # Terminal 1：硬體
@@ -329,14 +329,23 @@ ros2 run pros_car_py rectangle_drive
 # 長方形：長邊 2m、寬邊 1m（邊 1→3 走 2m，邊 2→4 走 1m）
 ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=2.0 -p width_m:=1.0
 
+# 四邊各自指定（未指定者：side1/3 用 length_m，side2/4 用 width_m）
+ros2 run pros_car_py rectangle_drive --ros-args \
+  -p side1_m:=0.85 -p side2_m:=2.95 -p side3_m:=0.85 -p side4_m:=2.95 \
+  -p turn1_deg:=48.5 -p turn2_deg:=49.0 -p turn3_deg:=50.0
+
 # 小範圍測試
 ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=0.5 -p width_m:=0.3
 
 # 慣性仍過頭時，再調小 turn_deg（預設 85°，實際約接近 90°）
 ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=0.5 -p width_m:=0.3 -p turn_deg:=82.0
+
+# 每次轉彎可單獨調角（未指定者沿用 turn_deg）
+ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=0.85 -p width_m:=3.12 \
+  -p turn1_deg:=54.0 -p turn2_deg:=82.0 -p turn3_deg:=85.0
 ```
 
-走行順序：前進 `length_m` → 右轉 `turn_deg` → 前進 `width_m` → 右轉 `turn_deg` → …。預設 `turn_deg:=85` 是為了補償停車慣性。Ctrl+C 會自動停車。
+走行順序：前進 side1 → 右轉 → 前進 side2 → 右轉 → …。`length_m` / `width_m` 為 side 預設（1/3 用 length、2/4 用 width）；`side1_m`～`side4_m` 可個別覆寫。轉彎同理：`turn_deg` 為預設，`turn1_deg`～`turn3_deg` 可個別覆寫。Ctrl+C 會自動停車。
 
 轉彎脈衝等進階參數仍寫在 `pros_car_py/rectangle_drive_node.py`（`TURN_PULSE_SEC` 等），實車偏差大時改常數後重新 build。
 
