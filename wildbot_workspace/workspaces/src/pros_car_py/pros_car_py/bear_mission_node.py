@@ -145,6 +145,8 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("amcl_wait_timeout_sec", 120.0)
         self.declare_parameter("startup_forward_m", 0.0)       # 啟動後先前進這麼多（0=不動）
         self.declare_parameter("startup_forward_speed", 0.25)  # 初始前進速度 m/s
+        self.declare_parameter("startup_moves", "")            # 序列如 "F:0.85,R:90,F:0.30"（優先於 startup_forward_m）
+        self.declare_parameter("startup_rotation_speed", 0.8)  # 啟動旋轉速度 rad/s
         self.declare_parameter("obstacle_guard_enabled", True)
         self.declare_parameter("obstacle_stop_m", -1.0)
         self.declare_parameter("obstacle_slow_m", -1.0)
@@ -1442,45 +1444,56 @@ class BearMissionHost(RosCommunicator):
             self.publish_robot_arm_angle([3.67, 0.5, 4.0])
             time.sleep(2.0)
 
-        # 啟動初始前進
-        startup_forward_m = (
-            self.get_parameter("startup_forward_m").get_parameter_value().double_value
-        )
+        # 啟動移動序列
         startup_forward_speed = (
             self.get_parameter("startup_forward_speed").get_parameter_value().double_value
         )
-        if startup_forward_m > 0.01 and not use_unity:
-            self.get_logger().info(f"[startup] 初始前進 {startup_forward_m:.2f}m ...")
-            start_odom = None
-            for _ in range(50):
-                start_odom = self.get_latest_odom()
-                if start_odom is not None:
-                    break
-                time.sleep(0.05)
-            if start_odom is not None:
-                sx = start_odom.pose.pose.position.x
-                sy = start_odom.pose.pose.position.y
-                timeout = startup_forward_m / max(startup_forward_speed, 0.1) * 2.5
-                t_start = time.monotonic()
-                while rclpy.ok():
-                    if time.monotonic() - t_start > timeout:
-                        self.get_logger().warn("[startup] 初始前進 timeout，繼續任務。")
+        startup_rotation_speed = (
+            self.get_parameter("startup_rotation_speed").get_parameter_value().double_value
+        )
+        startup_moves_str = (
+            self.get_parameter("startup_moves").get_parameter_value().string_value.strip()
+        )
+        startup_forward_m = (
+            self.get_parameter("startup_forward_m").get_parameter_value().double_value
+        )
+        if not use_unity:
+            if startup_moves_str:
+                self._run_startup_sequence(
+                    startup_moves_str, startup_forward_speed, startup_rotation_speed
+                )
+            elif startup_forward_m > 0.01:
+                # 向後相容：只設了 startup_forward_m 時的舊行為
+                self.get_logger().info(f"[startup] 初始前進 {startup_forward_m:.2f}m ...")
+                start_odom = None
+                for _ in range(50):
+                    start_odom = self.get_latest_odom()
+                    if start_odom is not None:
                         break
-                    odom = self.get_latest_odom()
-                    if odom is not None:
-                        dx = odom.pose.pose.position.x - sx
-                        dy = odom.pose.pose.position.y - sy
-                        traveled = math.sqrt(dx * dx + dy * dy)
-                        if traveled >= startup_forward_m:
-                            self.get_logger().info(
-                                f"[startup] 前進完成 {traveled:.3f}m。"
-                            )
-                            break
-                    self.publish_raw_car_control([startup_forward_speed, 0.0])
                     time.sleep(0.05)
-                self.publish_raw_car_control([0.0, 0.0])
-            else:
-                self.get_logger().warn("[startup] 收不到 odom，跳過初始前進。")
+                if start_odom is not None:
+                    sx = start_odom.pose.pose.position.x
+                    sy = start_odom.pose.pose.position.y
+                    timeout = startup_forward_m / max(startup_forward_speed, 0.1) * 2.5
+                    t0_sf = time.monotonic()
+                    while rclpy.ok():
+                        if time.monotonic() - t0_sf > timeout:
+                            self.get_logger().warn("[startup] 初始前進 timeout，繼續任務。")
+                            break
+                        odom = self.get_latest_odom()
+                        if odom is not None:
+                            dx = odom.pose.pose.position.x - sx
+                            dy = odom.pose.pose.position.y - sy
+                            if math.sqrt(dx * dx + dy * dy) >= startup_forward_m:
+                                self.get_logger().info(
+                                    f"[startup] 前進完成 {startup_forward_m:.3f}m。"
+                                )
+                                break
+                        self.publish_raw_car_control([startup_forward_speed, 0.0])
+                        time.sleep(0.05)
+                    self.publish_raw_car_control([0.0, 0.0])
+                else:
+                    self.get_logger().warn("[startup] 收不到 odom，跳過初始前進。")
 
         # 距離分區定義（公尺）
         #  dist > zone_far   : 全速直衝（300），方向只做大角度修正
@@ -1544,6 +1557,10 @@ class BearMissionHost(RosCommunicator):
         locked_dx_time = None  # 鎖住的時間
         prev_approach_dist = None
         nav.reset_visual_servo()
+
+        # 去程路徑記錄：每 0.1m 存一個 AMCL + odom 座標，供回程使用
+        outbound_waypoints: list = []   # [(amcl_x, amcl_y, odom_x, odom_y), ...]
+        _last_wp_amcl_xy: tuple | None = None
 
         while time.monotonic() - t_start < t_approach_max and rclpy.ok():
             ti = dp.get_yolo_target_info()
@@ -1743,6 +1760,9 @@ class BearMissionHost(RosCommunicator):
                 prev_approach_dist = live_dist
 
             amcl_pose = self.get_latest_amcl_pose()
+            _last_wp_amcl_xy = self._record_outbound_waypoint(
+                amcl_pose, self.get_latest_odom(), outbound_waypoints, _last_wp_amcl_xy
+            )
             progress_yaw_rad = 0.10 if yolo_search_confirmed else None
             self._update_motion_progress(
                 motion_progress,
@@ -2475,17 +2495,9 @@ class BearMissionHost(RosCommunicator):
                                 emit_detail=mission_verbose_log,
                             )
                             front_blocked = obs_nav.front_clearance_m < nav_obstacle_stop_m
-                            side_front_squeeze = (
-                                min(obs_nav.sensor_left_m, obs_nav.sensor_right_m)
-                                < 0.45
-                                and obs_nav.sensor_front_m < 0.45
-                            )
-                            if front_blocked or side_front_squeeze:
-                                side_m = min(obs_nav.sensor_left_m, obs_nav.sensor_right_m)
+                            if front_blocked:
                                 reason = (
                                     f"front={obs_nav.front_clearance_m:.2f}m < {nav_obstacle_stop_m:.2f}m"
-                                    if front_blocked
-                                    else f"side={side_m:.2f}m + front={obs_nav.sensor_front_m:.2f}m both < {obstacle_guard.slow_m:.2f}m"
                                 )
                                 self.get_logger().warn(
                                     f"[nav/obstacle] {reason} — cancel Nav2 goal."
@@ -2627,14 +2639,31 @@ class BearMissionHost(RosCommunicator):
                 self.get_logger().warn(
                     "[fallback] Triggered: Nav2 retries exhausted while still far from home."
                 )
-            fallback_ok = self._fallback_drive_home(
-                home_pose=home_pose,
-                timeout_sec=fallback_home_timeout_sec,
-                arrival_xy_thresh_m=fallback_arrival_xy_thresh_m,
-                heading_thresh_deg=fallback_heading_thresh_deg,
-                rotate_step_sec=fallback_rotate_step_sec,
-                forward_step_sec=fallback_forward_step_sec,
-            )
+            # 優先用去程 waypoints 回家（AMCL primary / odom fallback）
+            if outbound_waypoints:
+                self.get_logger().info(
+                    f"[fallback] Trying waypoint return ({len(outbound_waypoints)} waypoints)."
+                )
+                fallback_ok = self._navigate_home_via_waypoints(
+                    waypoints=outbound_waypoints,
+                    home_pose=home_pose,
+                    home_odom=home_odom,
+                    arrival_thresh_m=fallback_arrival_xy_thresh_m,
+                    rotate_step_sec=fallback_rotate_step_sec,
+                    forward_step_sec=fallback_forward_step_sec,
+                )
+            else:
+                self.get_logger().warn(
+                    "[fallback] No waypoints recorded — fallback to direct AMCL drive."
+                )
+                fallback_ok = self._fallback_drive_home(
+                    home_pose=home_pose,
+                    timeout_sec=fallback_home_timeout_sec,
+                    arrival_xy_thresh_m=fallback_arrival_xy_thresh_m,
+                    heading_thresh_deg=fallback_heading_thresh_deg,
+                    rotate_step_sec=fallback_rotate_step_sec,
+                    forward_step_sec=fallback_forward_step_sec,
+                )
             if fallback_ok:
                 nav_succeeded = True
                 status = GoalStatus.STATUS_SUCCEEDED
@@ -3065,6 +3094,322 @@ class BearMissionHost(RosCommunicator):
             self.get_logger().warn(
                 "Skip heading align: robot is not close enough to home."
             )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Startup move sequence
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _run_startup_sequence(
+        self,
+        moves_str: str,
+        fwd_speed: float,
+        rot_speed: float,
+    ) -> None:
+        """
+        Execute a configurable startup movement sequence.
+
+        moves_str format: comma-separated tokens, each "<DIR>:<value>"
+          F:<m>    forward m metres
+          B:<m>    backward m metres
+          R:<deg>  rotate clockwise deg degrees in place
+          L:<deg>  rotate counterclockwise deg degrees in place
+
+        Example: "F:0.85,R:90,F:0.30"
+        """
+        steps = []
+        for token in moves_str.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            parts = token.split(":", 1)
+            if len(parts) != 2:
+                self.get_logger().warn(f"[startup] Bad token '{token}' — skip.")
+                continue
+            direction = parts[0].strip().upper()
+            try:
+                value = float(parts[1].strip())
+            except ValueError:
+                self.get_logger().warn(f"[startup] Bad value in '{token}' — skip.")
+                continue
+            if direction not in ("F", "B", "R", "L"):
+                self.get_logger().warn(
+                    f"[startup] Unknown direction '{direction}' (use F/B/R/L) — skip."
+                )
+                continue
+            steps.append((direction, value))
+
+        if not steps:
+            self.get_logger().warn("[startup] No valid steps parsed, skip sequence.")
+            return
+
+        self.get_logger().info(
+            f"[startup] Sequence ({len(steps)} steps): "
+            + ", ".join(f"{d}:{v}" for d, v in steps)
+        )
+
+        for idx, (direction, value) in enumerate(steps):
+            step_label = f"step {idx + 1}/{len(steps)} {direction}:{value}"
+            odom = self.get_latest_odom()
+            if odom is None:
+                self.get_logger().warn(f"[startup] No odom for {step_label} — skip.")
+                continue
+
+            if direction in ("F", "B"):
+                sx = odom.pose.pose.position.x
+                sy = odom.pose.pose.position.y
+                linear = fwd_speed if direction == "F" else -fwd_speed
+                timeout = value / max(abs(fwd_speed), 0.05) * 2.5
+                self.get_logger().info(
+                    f"[startup] {step_label}: "
+                    f"{'forward' if direction == 'F' else 'backward'} {value:.2f}m …"
+                )
+                t0 = time.monotonic()
+                while rclpy.ok() and time.monotonic() - t0 < timeout:
+                    odom = self.get_latest_odom()
+                    if odom is not None:
+                        dx = odom.pose.pose.position.x - sx
+                        dy = odom.pose.pose.position.y - sy
+                        if math.hypot(dx, dy) >= value:
+                            self.get_logger().info(
+                                f"[startup] {step_label} done ({math.hypot(dx, dy):.3f}m)."
+                            )
+                            break
+                    self.publish_raw_car_control([linear, 0.0])
+                    time.sleep(0.05)
+                else:
+                    self.get_logger().warn(f"[startup] {step_label} timeout.")
+
+            else:  # R or L
+                target_rad = math.radians(value)
+                # R = clockwise = negative angular_z; L = counterclockwise = positive
+                angular = rot_speed if direction == "L" else -rot_speed
+                timeout = target_rad / max(rot_speed, 0.1) * 2.5
+                self.get_logger().info(
+                    f"[startup] {step_label}: "
+                    f"rotate {'left' if direction == 'L' else 'right'} {value:.1f}° …"
+                )
+                accumulated = 0.0
+                last_yaw = self._yaw_from_quat(odom.pose.pose.orientation)
+                t0 = time.monotonic()
+                while rclpy.ok() and time.monotonic() - t0 < timeout:
+                    odom = self.get_latest_odom()
+                    if odom is not None:
+                        cur_yaw = self._yaw_from_quat(odom.pose.pose.orientation)
+                        accumulated += abs(self._normalize_angle(cur_yaw - last_yaw))
+                        last_yaw = cur_yaw
+                        if accumulated >= target_rad:
+                            self.get_logger().info(
+                                f"[startup] {step_label} done "
+                                f"({math.degrees(accumulated):.1f}°)."
+                            )
+                            break
+                    self.publish_raw_car_control([0.0, angular])
+                    time.sleep(0.05)
+                else:
+                    self.get_logger().warn(f"[startup] {step_label} timeout.")
+
+            self.publish_raw_car_control([0.0, 0.0])
+            time.sleep(0.1)  # brief pause between steps
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Waypoint-based return navigation
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _record_outbound_waypoint(
+        amcl_msg,
+        odom_msg,
+        waypoints: list,
+        last_xy: tuple | None,
+        step_m: float = 0.1,
+    ) -> tuple | None:
+        """Record (amcl_x, amcl_y, odom_x, odom_y) every step_m. Returns updated last_xy."""
+        if amcl_msg is None:
+            return last_xy
+        ax = amcl_msg.pose.pose.position.x
+        ay = amcl_msg.pose.pose.position.y
+        if last_xy is None or math.hypot(ax - last_xy[0], ay - last_xy[1]) >= step_m:
+            ox = odom_msg.pose.pose.position.x if odom_msg is not None else 0.0
+            oy = odom_msg.pose.pose.position.y if odom_msg is not None else 0.0
+            waypoints.append((ax, ay, ox, oy))
+            return (ax, ay)
+        return last_xy
+
+    def _navigate_home_via_waypoints(
+        self,
+        waypoints: list,
+        home_pose,
+        home_odom,
+        arrival_thresh_m: float = 0.30,
+        wp_thresh_m: float = 0.25,
+        rotate_step_sec: float = 0.30,
+        forward_step_sec: float = 0.30,
+        amcl_cov_thresh: float = 0.25,
+        amcl_stale_sec: float = 2.0,
+        amcl_no_progress_sec: float = 8.0,
+        per_wp_timeout_sec: float = 25.0,
+    ) -> bool:
+        """
+        Navigate home through outbound waypoints in reverse.
+        Primary: AMCL closed-loop.  Fallback: odom closed-loop.
+        Returns True when within arrival_thresh_m of home.
+        """
+        import rclpy.time as rclpy_time
+
+        if not waypoints:
+            self.get_logger().warn("[wp_nav] No waypoints — skip.")
+            return False
+
+        targets = list(reversed(waypoints))
+        self.get_logger().info(
+            f"[wp_nav] Waypoint return: {len(targets)} waypoints, "
+            f"every ~0.1m, AMCL primary / odom fallback."
+        )
+
+        amcl_ok = True
+
+        for i, (ax, ay, ox, oy) in enumerate(targets):
+            wp_label = f"{i + 1}/{len(targets)}"
+            is_last = i == len(targets) - 1
+            goal_thresh = arrival_thresh_m if is_last else wp_thresh_m
+            t_wp = time.monotonic()
+            last_dist_to_wp = None
+            last_progress_t = time.monotonic()
+
+            while rclpy.ok() and time.monotonic() - t_wp < per_wp_timeout_sec:
+                amcl_msg = self.get_latest_amcl_pose()
+
+                if amcl_msg is None:
+                    amcl_ok = False
+                    self.get_logger().warn("[wp_nav] AMCL unavailable → odom fallback.")
+                    break
+
+                if amcl_ok:
+                    # Quality checks
+                    cov = amcl_msg.pose.covariance
+                    xy_var = max(cov[0], cov[7])
+                    age = (
+                        self.get_clock().now()
+                        - rclpy_time.Time.from_msg(amcl_msg.header.stamp)
+                    ).nanoseconds * 1e-9
+                    if xy_var > amcl_cov_thresh or age > amcl_stale_sec:
+                        self.get_logger().warn(
+                            f"[wp_nav] AMCL quality low (cov={xy_var:.3f}, age={age:.1f}s) "
+                            "→ odom fallback."
+                        )
+                        amcl_ok = False
+                        break
+
+                cx = amcl_msg.pose.pose.position.x
+                cy = amcl_msg.pose.pose.position.y
+
+                # Check if already at home (skip remaining waypoints)
+                d_home = self._dist_xy(amcl_msg.pose.pose, home_pose)
+                if d_home <= arrival_thresh_m:
+                    self.publish_car_control("STOP")
+                    self.get_logger().info(
+                        f"[wp_nav] Home reached ({d_home:.3f}m) at wp {wp_label}."
+                    )
+                    return True
+
+                # Progress check toward current waypoint
+                d_wp = math.hypot(cx - ax, cy - ay)
+                if last_dist_to_wp is None or (last_dist_to_wp - d_wp) >= 0.05:
+                    last_dist_to_wp = d_wp
+                    last_progress_t = time.monotonic()
+                elif time.monotonic() - last_progress_t > amcl_no_progress_sec:
+                    self.get_logger().warn(
+                        f"[wp_nav] No progress for {amcl_no_progress_sec:.0f}s "
+                        f"at wp {wp_label} → odom fallback."
+                    )
+                    amcl_ok = False
+                    break
+
+                if d_wp <= goal_thresh:
+                    self.publish_car_control("STOP")
+                    break
+
+                # Steer toward waypoint
+                curr_yaw = self._yaw_from_quat(amcl_msg.pose.pose.orientation)
+                heading_err = self._normalize_angle(
+                    math.atan2(ay - cy, ax - cx) - curr_yaw
+                )
+                if abs(heading_err) > math.radians(20.0):
+                    self.publish_car_control(
+                        "COUNTERCLOCKWISE_ROTATION"
+                        if heading_err > 0.0
+                        else "CLOCKWISE_ROTATION"
+                    )
+                    time.sleep(rotate_step_sec)
+                else:
+                    self.publish_car_control("FORWARD_SLOW")
+                    time.sleep(forward_step_sec)
+                self.publish_car_control("STOP")
+                time.sleep(0.03)
+
+            if not amcl_ok:
+                # Build remaining odom targets: current wp onwards + home
+                remaining = [(ox2, oy2) for (_, _, ox2, oy2) in targets[i:]]
+                if home_odom is not None:
+                    remaining.append(
+                        (home_odom.position.x, home_odom.position.y)
+                    )
+                self.get_logger().warn(
+                    f"[wp_nav] Odom fallback: {len(remaining)} segments remaining."
+                )
+                return self._navigate_waypoints_odom(
+                    remaining, arrival_thresh_m=arrival_thresh_m
+                )
+
+        # All waypoints visited — verify final position
+        final_msg = self.get_latest_amcl_pose()
+        if final_msg is not None:
+            d = self._dist_xy(final_msg.pose.pose, home_pose)
+            self.get_logger().info(f"[wp_nav] All waypoints done, dist_home={d:.3f}m.")
+            return d <= arrival_thresh_m
+        return False
+
+    def _navigate_waypoints_odom(
+        self,
+        waypoints_xy: list,
+        arrival_thresh_m: float = 0.30,
+        per_wp_thresh_m: float = 0.22,
+        per_wp_timeout_sec: float = 20.0,
+    ) -> bool:
+        """Navigate through a list of (x, y) odom positions in order."""
+        for i, (tx, ty) in enumerate(waypoints_xy):
+            is_last = i == len(waypoints_xy) - 1
+            goal_thresh = arrival_thresh_m if is_last else per_wp_thresh_m
+            t0 = time.monotonic()
+            while rclpy.ok() and time.monotonic() - t0 < per_wp_timeout_sec:
+                odom = self.get_latest_odom()
+                if odom is None:
+                    time.sleep(0.05)
+                    continue
+                cx = odom.pose.pose.position.x
+                cy = odom.pose.pose.position.y
+                dist = math.hypot(tx - cx, ty - cy)
+                if dist <= goal_thresh:
+                    self.publish_car_control("STOP")
+                    break
+                cur_yaw = self._yaw_from_quat(odom.pose.pose.orientation)
+                yaw_err = self._normalize_angle(math.atan2(ty - cy, tx - cx) - cur_yaw)
+                if abs(yaw_err) > 0.40:
+                    self.publish_raw_car_control(
+                        [0.0, 0.9 * math.copysign(1.0, yaw_err)]
+                    )
+                else:
+                    self.publish_raw_car_control(
+                        [min(0.20, dist * 0.5), 1.0 * yaw_err]
+                    )
+                time.sleep(0.05)
+            self.publish_car_control("STOP")
+
+        odom = self.get_latest_odom()
+        if odom is None or not waypoints_xy:
+            return False
+        tx, ty = waypoints_xy[-1]
+        return math.hypot(tx - odom.pose.pose.position.x, ty - odom.pose.pose.position.y) <= arrival_thresh_m
 
     def _fallback_drive_home(
         self,

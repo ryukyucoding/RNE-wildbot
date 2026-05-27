@@ -245,6 +245,33 @@ ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/Joint
 
 ## 🐻 去抓熊任務
 
+### startup_moves 啟動移動序列（選用）
+
+用逗號串接多個動作，取代單純的 `startup_forward_m`：
+
+| Token | 動作 | 單位 |
+|-------|------|------|
+| `F:<m>` | 前進 | 公尺 |
+| `B:<m>` | 後退 | 公尺 |
+| `R:<deg>` | 原地右轉（順時鐘） | 度 |
+| `L:<deg>` | 原地左轉（逆時鐘） | 度 |
+
+```
+-p startup_moves:="F:0.85,R:90,F:0.50"   # 前進 0.85m → 右轉 90° → 前進 0.50m
+-p startup_forward_speed:=0.25            # 前進速度 m/s（F/B 共用）
+-p startup_rotation_speed:=0.8           # 旋轉速度 rad/s（R/L 共用）
+```
+
+原本：
+```
+  -p startup_forward_m:=0.85 \
+  -p startup_forward_speed:=0.25
+```
+
+
+> `startup_moves` 有設定時會優先執行，忽略 `startup_forward_m`。
+> 不設 `startup_moves` 則維持舊行為（`startup_forward_m` 直線前進）。
+
 ```bash
 cd /workspaces
 colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
