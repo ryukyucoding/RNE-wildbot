@@ -251,7 +251,7 @@ colcon build --packages-select pros_car_py --symlink-install && source install/s
 
 ros2 run pros_car_py bear_mission --ros-args \
   -p amcl_wait_timeout_sec:=30.0 \
-  -p grasp_trigger_dist_m:=0.3 \
+  -p grasp_trigger_dist_m:=0.4 \
   -p approach_stop_dist_m:=0.3 \
   -p visual_servo_target_depth_m:=0.6 \
   -p visual_servo_yaw_deadband_px:=80.0 \
@@ -271,7 +271,9 @@ ros2 run pros_car_py bear_mission --ros-args \
   -p approach_yolo_search_spin_speed_tier:=slow \
   -p approach_yolo_explore_forward_sec:=2.0 \
   -p visual_servo_dx_ema_alpha:=0.08 \
-  -p visual_servo_min_yaw_large_px:=12.0
+  -p visual_servo_min_yaw_large_px:=12.0 \
+  -p startup_forward_m:=0.85 \
+  -p startup_forward_speed:=0.25
 
 ```
 

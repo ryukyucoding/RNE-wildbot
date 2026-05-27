@@ -143,6 +143,8 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("auto_start_delay_sec", 2.0)
         self.declare_parameter("repeat_mission", True)
         self.declare_parameter("amcl_wait_timeout_sec", 120.0)
+        self.declare_parameter("startup_forward_m", 0.0)       # 啟動後先前進這麼多（0=不動）
+        self.declare_parameter("startup_forward_speed", 0.25)  # 初始前進速度 m/s
         self.declare_parameter("obstacle_guard_enabled", True)
         self.declare_parameter("obstacle_stop_m", -1.0)
         self.declare_parameter("obstacle_slow_m", -1.0)
@@ -1439,6 +1441,46 @@ class BearMissionHost(RosCommunicator):
             )
             self.publish_robot_arm_angle([3.67, 0.5, 4.0])
             time.sleep(2.0)
+
+        # 啟動初始前進
+        startup_forward_m = (
+            self.get_parameter("startup_forward_m").get_parameter_value().double_value
+        )
+        startup_forward_speed = (
+            self.get_parameter("startup_forward_speed").get_parameter_value().double_value
+        )
+        if startup_forward_m > 0.01 and not use_unity:
+            self.get_logger().info(f"[startup] 初始前進 {startup_forward_m:.2f}m ...")
+            start_odom = None
+            for _ in range(50):
+                start_odom = self.get_latest_odom()
+                if start_odom is not None:
+                    break
+                time.sleep(0.05)
+            if start_odom is not None:
+                sx = start_odom.pose.pose.position.x
+                sy = start_odom.pose.pose.position.y
+                timeout = startup_forward_m / max(startup_forward_speed, 0.1) * 2.5
+                t_start = time.monotonic()
+                while rclpy.ok():
+                    if time.monotonic() - t_start > timeout:
+                        self.get_logger().warn("[startup] 初始前進 timeout，繼續任務。")
+                        break
+                    odom = self.get_latest_odom()
+                    if odom is not None:
+                        dx = odom.pose.pose.position.x - sx
+                        dy = odom.pose.pose.position.y - sy
+                        traveled = math.sqrt(dx * dx + dy * dy)
+                        if traveled >= startup_forward_m:
+                            self.get_logger().info(
+                                f"[startup] 前進完成 {traveled:.3f}m。"
+                            )
+                            break
+                    self.publish_raw_car_control([startup_forward_speed, 0.0])
+                    time.sleep(0.05)
+                self.publish_raw_car_control([0.0, 0.0])
+            else:
+                self.get_logger().warn("[startup] 收不到 odom，跳過初始前進。")
 
         # 距離分區定義（公尺）
         #  dist > zone_far   : 全速直衝（300），方向只做大角度修正
