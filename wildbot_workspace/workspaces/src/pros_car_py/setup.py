@@ -25,6 +25,7 @@ setup(
             "bear_mission = pros_car_py.bear_mission_node:main",
             "push_mission = pros_car_py.push_mission_node:main",
             "rectangle_drive = pros_car_py.rectangle_drive_node:main",
+            "approach_grab = pros_car_py.approach_grab_node:main",
             "door_open = pros_car_py.door_open_task:main",
             "carC_reader = pros_car_py.carC_serial_reader:main",
             "carC_writer = pros_car_py.carC_serial_writer:main",

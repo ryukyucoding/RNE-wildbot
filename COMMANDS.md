@@ -380,6 +380,43 @@ ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=0.85 -p width_m:=3.
 
 ---
 
+## 🤖 接近並抓取（approach_grab）
+
+不需 AMCL / Nav2 / YOLO / 地圖，只要硬體、odom 與手臂在跑。
+
+走行順序：**前進 forward1 → 右轉 turn_deg → 前進 forward2 → 在三個角度各夾取一次**（`grab_turn1_deg`～`grab_turn3_deg` 為每次抓取前的增量轉角；預設 `0° / 120° / 120°`）。
+
+```bash
+# Terminal 1：硬體
+cd ~/RNE/wildbot_workspace
+./scripts/00_start_all.sh
+
+# Terminal 2：wildbot 容器內
+docker exec -it wildbot bash
+cd /workspaces
+colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
+
+# 預設參數
+ros2 run pros_car_py approach_grab
+
+# 自訂走行與掃描角度
+ros2 run pros_car_py approach_grab --ros-args \
+  -p forward1_m:=0.85 -p forward2_m:=0.55 -p turn_deg:=48.5 \
+  -p grab_turn1_deg:=0.0 -p grab_turn2_deg:=120.0 -p grab_turn3_deg:=120.0
+
+# 較窄掃描（例：0° / 45° / 90°）
+ros2 run pros_car_py approach_grab --ros-args \
+  -p grab_turn1_deg:=0.0 -p grab_turn2_deg:=45.0 -p grab_turn3_deg:=45.0
+
+# Launch
+ros2 launch pros_car_py approach_grab.launch.py \
+  forward1_m:=0.85 forward2_m:=0.55 turn_deg:=48.5
+```
+
+**注意**：`run_grasp_blocking()` 無「已夾到物體」回饋，節點會依序完成三次夾取動作（除非 Ctrl+C）。抓取間預設會打開夾爪回到待機姿勢（`reopen_gripper_between_tries:=true`）。進階脈衝常數見 `pros_car_py/approach_grab_node.py`。
+
+---
+
 ## 🔍 偵錯指令
 
 ```bash
