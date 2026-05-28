@@ -1,4 +1,4 @@
-# Wildbot 常用指令手冊
+# ˊWildbot 常用指令手冊
 
 ---
 
@@ -107,7 +107,7 @@ sleep 10 && docker restart compose-localization-1
 
 ```bash
 cd ~/RNE/wildbot_workspace
-./scripts/set_initial_pose.sh 1.281666937320418 -2.370965180685683 -0.0979
+./scripts/set_initial_pose.sh 4.870740515182902 2.9381473065802726 2.8279
 ```
 
 > **座標更新方式**：機器人放好、AMCL 收斂後，跑一次 `./scripts/save_current_pose.sh`，
@@ -261,7 +261,7 @@ ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/Joint
 
 
 ```
--p startup_moves:="F:0.85,R:90,F:0.50"   # 前進 0.85m → 右轉 90° → 前進 0.50m
+-p startup_moves:="F:0.35,R:90,F:0.10"   # 前進 0.85m → 右轉 90° → 前進 0.50m
 -p startup_forward_speed:=0.25            # 前進速度 m/s（F/B 共用）
 -p startup_rotation_speed:=0.8           # 旋轉速度 rad/s（R/L 共用）
 ```
@@ -282,7 +282,7 @@ colcon build --packages-select pros_car_py --symlink-install && source install/s
 
 ros2 run pros_car_py bear_mission --ros-args \
   -p amcl_wait_timeout_sec:=30.0 \
-  -p grasp_trigger_dist_m:=0.3 \
+  -p grasp_trigger_dist_m:=0.4 \
   -p approach_stop_dist_m:=0.3 \
   -p visual_servo_target_depth_m:=0.6 \
   -p visual_servo_yaw_deadband_px:=80.0 \
@@ -303,8 +303,10 @@ ros2 run pros_car_py bear_mission --ros-args \
   -p approach_yolo_explore_forward_sec:=2.0 \
   -p visual_servo_dx_ema_alpha:=0.08 \
   -p visual_servo_min_yaw_large_px:=12.0 \
-  -p startup_forward_m:=0.85 \
-  -p startup_forward_speed:=0.25
+  -p startup_moves:="F:1.6,L:75,F:0.1"   # 前進 0.85m → 右轉 90° → 前進 0.50m
+  -p startup_moves:="F:1.2"
+  -p startup_forward_speed:=0.18            # 前進速度 m/s（F/B 共用）
+  -p startup_rotation_speed:=0.8           # 旋轉速度 rad/s（R/L 共用）
 
 ```
 

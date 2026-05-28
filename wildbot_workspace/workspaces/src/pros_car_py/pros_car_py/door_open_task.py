@@ -29,9 +29,10 @@ from pros_car_py.nav_processing import Nav2Processing
 from pros_car_py.ros_communicator import RosCommunicator
 
 
-DEFAULT_LENGTH_M = 0.85
+DEFAULT_LENGTH_M = 0.8
 DEFAULT_WIDTH_M = 2.95
-DEFAULT_TURN_DEG = 48.5
+DEFAULT_TURN_DEG = 75
+DEFAULT_POST_WIDTH_FORWARD_M = 1.6
 TURN_TOLERANCE_DEG = 2.0
 FORWARD_ACTION = "FORWARD_SLOW"
 TURN_RIGHT_ACTION = "CLOCKWISE_ROTATION"
@@ -118,6 +119,7 @@ class DoorOpenTask:
         self.rc.declare_parameter("turn_deg", DEFAULT_TURN_DEG)
         self.rc.declare_parameter("forward_factor_a", 2.0)
         self.rc.declare_parameter("forward_factor_b", 0.5)
+        self.rc.declare_parameter("post_width_forward_m", DEFAULT_POST_WIDTH_FORWARD_M)
         self.rc.declare_parameter("run_pre_approach", True)
         self.rc.declare_parameter("yolo_target_label", "knob")
         self.rc.declare_parameter("vs_stop_distance", 0.30)
@@ -133,6 +135,9 @@ class DoorOpenTask:
         self.turn_deg = min(max(30.0, self._double_param("turn_deg")), 90.0)
         self.forward_factor_a = max(0.0, self._double_param("forward_factor_a"))
         self.forward_factor_b = max(0.0, self._double_param("forward_factor_b"))
+        self.post_width_forward_m = max(
+            0.1, self._double_param("post_width_forward_m")
+        )
         self.run_pre_approach = self._bool_param("run_pre_approach")
         self.yolo_target_label = self._string_param("yolo_target_label")
         self.vs_stop_distance = max(0.1, self._double_param("vs_stop_distance"))
@@ -193,9 +198,10 @@ class DoorOpenTask:
         print(
             "[DoorOpenTask] Pre-approach config: "
             f"{self.forward_factor_a:.2f} * length({self.length_m:.2f}m), "
-            f"right {self.turn_deg:.1f}deg, "
+            f"left {self.turn_deg:.1f}deg, "
             f"{self.forward_factor_b:.2f} * width({self.width_m:.2f}m), "
-            f"left {self.turn_deg:.1f}deg"
+            f"right {self.turn_deg:.1f}deg, "
+            f"forward {self.post_width_forward_m:.2f}m"
         )
         while rclpy.ok() and not self.step():
             time.sleep(spin_interval)
@@ -243,15 +249,17 @@ class DoorOpenTask:
         second_forward = self.width_m * self.forward_factor_b
         print(
             "[PreApproach] Running scripted approach: "
-            f"forward {first_forward:.2f}m, right {self.turn_deg:.1f}deg, "
-            f"forward {second_forward:.2f}m, left {self.turn_deg:.1f}deg."
+            f"forward {first_forward:.2f}m, left {self.turn_deg:.1f}deg, "
+            f"forward {second_forward:.2f}m, right {self.turn_deg:.1f}deg, "
+            f"forward {self.post_width_forward_m:.2f}m."
         )
 
         ok = (
             self._drive_forward(first_forward, 1)
-            and self._turn(self.turn_deg, 1, "right")
+            and self._turn(self.turn_deg, 1, "left")
             and self._drive_forward(second_forward, 2)
-            and self._turn(self.turn_deg, 2, "left")
+            and self._turn(self.turn_deg, 2, "right")
+            and self._drive_forward(self.post_width_forward_m, 3)
         )
         self.car.update_action("STOP")
 

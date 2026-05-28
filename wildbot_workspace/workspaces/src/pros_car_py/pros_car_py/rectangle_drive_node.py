@@ -33,7 +33,8 @@ DEFAULT_TURN_DEG = 48.5
 TURN_TOLERANCE_DEG = 2.0
 FORWARD_ACTION = "FORWARD_SLOW"
 TURN_ACTION = "COUNTERCLOCKWISE_ROTATION"
-FORWARD_PULSE_SEC = 0.0
+# 前進段維持連續輪速；轉彎仍用短脈衝做角度閉迴路
+FORWARD_LOOP_SEC = 0.05
 TURN_PULSE_SEC = 0.12
 SEGMENT_TIMEOUT_SEC = 30.0
 ODOM_WAIT_TIMEOUT_SEC = 10.0
@@ -98,7 +99,7 @@ class RectangleDriveNode(RosCommunicator):
             f"turns=[{', '.join(f'{d:.1f}°' for d in self.turn_degs)}] "
             f"±{TURN_TOLERANCE_DEG:.1f}° (慣性補償：目標角小於 90°), "
             f"forward={FORWARD_ACTION}, turn_action={TURN_ACTION}, "
-            f"pulse(forward={FORWARD_PULSE_SEC:.2f}s, turn={TURN_PULSE_SEC:.2f}s), "
+            f"loop(forward={FORWARD_LOOP_SEC:.2f}s, turn_pulse={TURN_PULSE_SEC:.2f}s), "
             f"raise_arm_on_start={self.raise_arm_on_start}"
         )
 
@@ -182,11 +183,9 @@ class RectangleDriveNode(RosCommunicator):
                 return True
 
             self.publish_car_control(FORWARD_ACTION)
-            time.sleep(FORWARD_PULSE_SEC)
-            self.publish_car_control("STOP")
-            time.sleep(0.03)
+            time.sleep(FORWARD_LOOP_SEC)
 
-        self.publish_car_control("STOP")
+        self._safe_stop()
         return False
 
     def _turn_left(self, turn_deg: float, turn_idx: int) -> bool:
@@ -249,8 +248,16 @@ class RectangleDriveNode(RosCommunicator):
             self.publish_car_control("STOP")
             time.sleep(0.03)
 
-        self.publish_car_control("STOP")
+        self._safe_stop()
         return False
+
+    def _safe_stop(self) -> None:
+        if not rclpy.ok():
+            return
+        try:
+            self.publish_car_control("STOP")
+        except Exception:
+            pass
 
     def _run_rectangle(self) -> None:
         if not self._wait_for_odom(ODOM_WAIT_TIMEOUT_SEC):
@@ -278,7 +285,7 @@ class RectangleDriveNode(RosCommunicator):
                     self.get_logger().error(f"第 {side_idx} 次轉彎失敗，任務中止。")
                     return
 
-        self.publish_car_control("STOP")
+        self._safe_stop()
         if rclpy.ok() and not self._abort:
             self.get_logger().info("=== 長方形走行完成 ===")
 
@@ -290,7 +297,7 @@ class RectangleDriveNode(RosCommunicator):
 
     def stop(self) -> None:
         self._abort = True
-        self.publish_car_control("STOP")
+        self._safe_stop()
 
 
 def main(args=None):
@@ -305,8 +312,9 @@ def main(args=None):
         pass
     finally:
         node.stop()
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -756,8 +756,8 @@ class BearMissionHost(RosCommunicator):
         dp: DataProcessor,
         guard: ObstacleGuard,
         max_yaw: float = 45.0,
-        left_react_m: float = 0.28,   # 左側較不敏感（比賽從左側出發）
-        right_react_m: float = 0.45,
+        left_react_m: float = 0.45,
+        right_react_m: float = 0.28,   # 右側較不敏感（比賽從右側出發）
         front_react_m: float = 0.40,  # 前方開始減速
         front_stop_m: float = 0.20,   # 前方此距離內完全擋住前進
         rear_react_m: float = 0.30,
