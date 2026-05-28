@@ -58,6 +58,15 @@ KNOB_Z_HEIGHT = 0.05
 
 DOOR_OPEN_ACTION = "FORWARD_SLOW"
 
+# Smooth pre-approach parameters
+_SMOOTH_HZ = 50          # cmd_vel heartbeat rate during pre-approach (Hz)
+_FORWARD_SPEED = 0.15    # cruise speed (m/s) – same as FORWARD_SLOW
+_TURN_SPEED = 1.2        # cruise angular speed (rad/s) – same as CLOCKWISE_ROTATION
+_RAMP_DIST_M = 0.10      # distance (m) over which to ramp speed at start/end
+_RAMP_DEG = 8.0          # angle (deg) over which to ramp angular speed at start/end
+_MIN_LINEAR = 0.06       # minimum linear speed during ramp (m/s)
+_MIN_ANGULAR = 0.35      # minimum angular speed during ramp (rad/s)
+
 
 def _yaw_from_quat(q) -> float:
     siny_cosp = 2.0 * (float(q.w) * float(q.z) + float(q.x) * float(q.y))
@@ -287,6 +296,11 @@ class DoorOpenTask:
         return max(SEGMENT_TIMEOUT_SEC, distance_m / 0.12 * 1.5)
 
     def _drive_forward(self, distance_m: float, segment_idx: int) -> bool:
+        """Drive forward distance_m using a trapezoid speed profile.
+
+        A background thread publishes cmd_vel at _SMOOTH_HZ so the heartbeat
+        is never broken by odom-check latency.
+        """
         segment_timeout_sec = self._segment_timeout_for(distance_m)
         start = self._get_xy_yaw()
         if start is None:
@@ -296,45 +310,81 @@ class DoorOpenTask:
         x0, y0, _ = start
         t0 = time.monotonic()
         last_log = 0.0
+        success = False
 
-        while rclpy.ok() and not self._abort:
-            if time.monotonic() - t0 > segment_timeout_sec:
-                self.car.update_action("STOP")
-                print(f"[PreApproach][forward {segment_idx}] Timeout.")
-                return False
+        # Shared mutable command: [linear_x, angular_z]
+        cmd = [_FORWARD_SPEED, 0.0]
+        stop_evt = threading.Event()
 
-            cur = self._get_xy_yaw()
-            if cur is None:
-                time.sleep(0.05)
-                continue
+        def _pub_loop():
+            period = 1.0 / _SMOOTH_HZ
+            while not stop_evt.is_set():
+                self.rc.publish_raw_car_control(cmd)
+                time.sleep(period)
 
-            x, y, _ = cur
-            traveled = math.hypot(x - x0, y - y0)
-            now = time.monotonic()
-            if now - last_log >= 1.0:
-                print(
-                    f"[PreApproach][forward {segment_idx}] "
-                    f"{traveled:.3f}m / {distance_m:.3f}m"
-                )
-                last_log = now
+        pub_thread = threading.Thread(target=_pub_loop, daemon=True)
+        pub_thread.start()
 
-            if traveled >= distance_m:
-                self.car.update_action("STOP")
-                print(
-                    f"[PreApproach][forward {segment_idx}] "
-                    f"done, actual={traveled:.3f}m"
-                )
-                return True
+        ramp = min(_RAMP_DIST_M, distance_m * 0.25)
 
-            self.car.update_action(FORWARD_ACTION)
-            time.sleep(0.05)
+        try:
+            while rclpy.ok() and not self._abort:
+                if time.monotonic() - t0 > segment_timeout_sec:
+                    print(f"[PreApproach][forward {segment_idx}] Timeout.")
+                    break
 
-        self.car.update_action("STOP")
-        return False
+                cur = self._get_xy_yaw()
+                if cur is None:
+                    time.sleep(0.02)
+                    continue
+
+                x, y, _ = cur
+                traveled = math.hypot(x - x0, y - y0)
+                remaining = max(0.0, distance_m - traveled)
+
+                now = time.monotonic()
+                if now - last_log >= 1.0:
+                    print(
+                        f"[PreApproach][forward {segment_idx}] "
+                        f"{traveled:.3f}m / {distance_m:.3f}m"
+                    )
+                    last_log = now
+
+                if traveled >= distance_m:
+                    print(
+                        f"[PreApproach][forward {segment_idx}] "
+                        f"done, actual={traveled:.3f}m"
+                    )
+                    success = True
+                    break
+
+                # Trapezoid: ramp up at start, ramp down near end
+                if traveled < ramp:
+                    t_ratio = traveled / ramp
+                elif remaining < ramp:
+                    t_ratio = remaining / ramp
+                else:
+                    t_ratio = 1.0
+                cmd[0] = _MIN_LINEAR + (_FORWARD_SPEED - _MIN_LINEAR) * t_ratio
+
+                time.sleep(0.02)
+        finally:
+            cmd[0] = 0.0
+            cmd[1] = 0.0
+            time.sleep(0.05)   # let the publisher send the zero once
+            stop_evt.set()
+            pub_thread.join(timeout=0.5)
+            self.car.update_action("STOP")
+
+        return success
 
     def _turn(self, turn_deg: float, turn_idx: int, direction: str) -> bool:
+        """Turn turn_deg degrees using a trapezoid angular-speed profile.
+
+        A background thread publishes cmd_vel at _SMOOTH_HZ so the heartbeat
+        is never broken by odom-check latency.
+        """
         sign = -1.0 if direction == "right" else 1.0
-        action = TURN_RIGHT_ACTION if direction == "right" else TURN_LEFT_ACTION
         target_rad = sign * math.radians(turn_deg)
         tol_rad = math.radians(TURN_TOLERANCE_DEG)
         start = self._get_xy_yaw()
@@ -347,50 +397,84 @@ class DoorOpenTask:
         last_yaw = start_yaw
         t0 = time.monotonic()
         last_log = 0.0
+        success = False
 
-        while rclpy.ok() and not self._abort:
-            if time.monotonic() - t0 > SEGMENT_TIMEOUT_SEC:
-                self.car.update_action("STOP")
-                print(f"[PreApproach][turn {turn_idx}] Timeout.")
-                return False
+        angular_cmd = sign * _TURN_SPEED
+        cmd = [0.0, angular_cmd]
+        stop_evt = threading.Event()
 
-            cur = self._get_xy_yaw()
-            if cur is None:
-                time.sleep(0.05)
-                continue
+        def _pub_loop():
+            period = 1.0 / _SMOOTH_HZ
+            while not stop_evt.is_set():
+                self.rc.publish_raw_car_control(cmd)
+                time.sleep(period)
 
-            _, _, yaw = cur
-            dyaw = _normalize_angle(yaw - last_yaw)
-            accumulated += dyaw
-            last_yaw = yaw
+        pub_thread = threading.Thread(target=_pub_loop, daemon=True)
+        pub_thread.start()
 
-            now = time.monotonic()
-            if now - last_log >= 1.0:
-                print(
-                    f"[PreApproach][turn {turn_idx} {direction}] "
-                    f"{math.degrees(accumulated):+.1f}deg / "
-                    f"{math.degrees(target_rad):+.1f}deg"
+        ramp_rad = math.radians(min(_RAMP_DEG, turn_deg * 0.25))
+        total_rad = math.radians(turn_deg)
+
+        try:
+            while rclpy.ok() and not self._abort:
+                if time.monotonic() - t0 > SEGMENT_TIMEOUT_SEC:
+                    print(f"[PreApproach][turn {turn_idx}] Timeout.")
+                    break
+
+                cur = self._get_xy_yaw()
+                if cur is None:
+                    time.sleep(0.02)
+                    continue
+
+                _, _, yaw = cur
+                dyaw = _normalize_angle(yaw - last_yaw)
+                accumulated += dyaw
+                last_yaw = yaw
+
+                now = time.monotonic()
+                if now - last_log >= 1.0:
+                    print(
+                        f"[PreApproach][turn {turn_idx} {direction}] "
+                        f"{math.degrees(accumulated):+.1f}deg / "
+                        f"{math.degrees(target_rad):+.1f}deg"
+                    )
+                    last_log = now
+
+                reached = (
+                    accumulated <= target_rad + tol_rad
+                    if direction == "right"
+                    else accumulated >= target_rad - tol_rad
                 )
-                last_log = now
+                if reached:
+                    print(
+                        f"[PreApproach][turn {turn_idx} {direction}] "
+                        f"done, actual={math.degrees(accumulated):+.1f}deg"
+                    )
+                    success = True
+                    break
 
-            reached = (
-                accumulated <= target_rad + tol_rad
-                if direction == "right"
-                else accumulated >= target_rad - tol_rad
-            )
-            if reached:
-                self.car.update_action("STOP")
-                print(
-                    f"[PreApproach][turn {turn_idx} {direction}] "
-                    f"done, actual={math.degrees(accumulated):+.1f}deg"
-                )
-                return True
+                # Trapezoid: ramp angular speed at start and near end
+                turned = abs(accumulated)
+                remaining = max(0.0, total_rad - turned)
+                if turned < ramp_rad:
+                    t_ratio = turned / ramp_rad if ramp_rad > 0 else 1.0
+                elif remaining < ramp_rad:
+                    t_ratio = remaining / ramp_rad if ramp_rad > 0 else 1.0
+                else:
+                    t_ratio = 1.0
+                speed = _MIN_ANGULAR + (_TURN_SPEED - _MIN_ANGULAR) * t_ratio
+                cmd[1] = sign * speed
 
-            self.car.update_action(action)
+                time.sleep(0.02)
+        finally:
+            cmd[0] = 0.0
+            cmd[1] = 0.0
             time.sleep(0.05)
+            stop_evt.set()
+            pub_thread.join(timeout=0.5)
+            self.car.update_action("STOP")
 
-        self.car.update_action("STOP")
-        return False
+        return success
 
     def _state_search(self) -> bool:
         if self._iter == 0:
