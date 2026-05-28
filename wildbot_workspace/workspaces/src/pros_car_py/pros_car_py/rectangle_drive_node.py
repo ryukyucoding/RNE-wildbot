@@ -1,13 +1,14 @@
 """
 長方形自動走行（rectangle_drive）
 
-行為：前進 → 左轉 90° × 3 次，共 4 段直線。
+行為：前進 → 轉彎 90° × 3 次，共 4 段直線（預設右轉；可改左轉）。
 使用 wheel odom 閉迴路，不需 AMCL / Nav2 / 地圖。
 
 用法（wildbot 容器內）：
   cd /workspaces
   colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
   ros2 run pros_car_py rectangle_drive
+  ros2 run pros_car_py rectangle_drive --ros-args -p turn_direction:=left
   ros2 run pros_car_py rectangle_drive --ros-args -p length_m:=2.0 -p width_m:=1.0 -p turn_deg:=85.0
   ros2 run pros_car_py rectangle_drive --ros-args \
     -p side1_m:=0.85 -p side2_m:=2.95 -p side3_m:=0.85 -p side4_m:=2.95 \
@@ -32,9 +33,9 @@ DEFAULT_WIDTH_M = 2.95
 DEFAULT_TURN_DEG = 48.5
 TURN_TOLERANCE_DEG = 2.0
 FORWARD_ACTION = "FORWARD_SLOW"
-TURN_ACTION = "COUNTERCLOCKWISE_ROTATION"
-# 前進段維持連續輪速；轉彎仍用短脈衝做角度閉迴路
-FORWARD_LOOP_SEC = 0.05
+TURN_RIGHT_ACTION = "CLOCKWISE_ROTATION"
+TURN_LEFT_ACTION = "COUNTERCLOCKWISE_ROTATION"
+FORWARD_PULSE_SEC = 0.15
 TURN_PULSE_SEC = 0.12
 SEGMENT_TIMEOUT_SEC = 30.0
 ODOM_WAIT_TIMEOUT_SEC = 10.0
@@ -60,6 +61,7 @@ class RectangleDriveNode(RosCommunicator):
         self.declare_parameter("length_m", DEFAULT_LENGTH_M)
         self.declare_parameter("width_m", DEFAULT_WIDTH_M)
         self.declare_parameter("turn_deg", DEFAULT_TURN_DEG)
+        self.declare_parameter("turn_direction", "right")
         self.declare_parameter("raise_arm_on_start", True)
         length_m = self.get_parameter("length_m").get_parameter_value().double_value
         width_m = self.get_parameter("width_m").get_parameter_value().double_value
@@ -85,6 +87,8 @@ class RectangleDriveNode(RosCommunicator):
             self.declare_parameter(pname, default_turn)
             val = self.get_parameter(pname).get_parameter_value().double_value
             self.turn_degs.append(min(max(30.0, float(val)), 90.0))
+        direction = str(self.get_parameter("turn_direction").value).strip().lower()
+        self.turn_direction = "left" if direction == "left" else "right"
         self.raise_arm_on_start = (
             self.get_parameter("raise_arm_on_start")
             .get_parameter_value()
@@ -92,14 +96,17 @@ class RectangleDriveNode(RosCommunicator):
         )
         self._mission_thread: threading.Thread | None = None
         self._abort = False
+        turn_action = (
+            TURN_LEFT_ACTION if self.turn_direction == "left" else TURN_RIGHT_ACTION
+        )
         self.get_logger().info(
             "Rectangle drive config: "
             f"sides=[{', '.join(f'{d:.2f}m' for d in self.side_lengths_m)}] "
             f"(length={self.length_m:.2f}m, width={self.width_m:.2f}m 為 side 預設), "
             f"turns=[{', '.join(f'{d:.1f}°' for d in self.turn_degs)}] "
-            f"±{TURN_TOLERANCE_DEG:.1f}° (慣性補償：目標角小於 90°), "
-            f"forward={FORWARD_ACTION}, turn_action={TURN_ACTION}, "
-            f"loop(forward={FORWARD_LOOP_SEC:.2f}s, turn_pulse={TURN_PULSE_SEC:.2f}s), "
+            f"±{TURN_TOLERANCE_DEG:.1f}° ({self.turn_direction}), "
+            f"forward={FORWARD_ACTION}, turn_action={turn_action}, "
+            f"pulse(forward={FORWARD_PULSE_SEC:.2f}s, turn={TURN_PULSE_SEC:.2f}s), "
             f"raise_arm_on_start={self.raise_arm_on_start}"
         )
 
@@ -188,8 +195,10 @@ class RectangleDriveNode(RosCommunicator):
         self._safe_stop()
         return False
 
-    def _turn_left(self, turn_deg: float, turn_idx: int) -> bool:
-        target_rad = math.radians(turn_deg)
+    def _turn(self, turn_deg: float, turn_idx: int) -> bool:
+        is_right = self.turn_direction == "right"
+        target_rad = -math.radians(turn_deg) if is_right else math.radians(turn_deg)
+        turn_action = TURN_RIGHT_ACTION if is_right else TURN_LEFT_ACTION
         tol_rad = math.radians(TURN_TOLERANCE_DEG)
         segment_timeout_sec = SEGMENT_TIMEOUT_SEC
         start = self._get_xy_yaw()
@@ -202,9 +211,10 @@ class RectangleDriveNode(RosCommunicator):
         last_yaw = start_yaw
         t0 = time.monotonic()
         last_log = 0.0
+        dir_label = "右轉" if is_right else "左轉"
 
         self.get_logger().info(
-            f"[turn {turn_idx}] 左轉 {turn_deg:.1f}° "
+            f"[turn {turn_idx}] {dir_label} {turn_deg:.1f}° "
             f"(起點 yaw={math.degrees(start_yaw):.1f}°)"
         )
 
@@ -235,7 +245,12 @@ class RectangleDriveNode(RosCommunicator):
                 )
                 last_log = now
 
-            if accumulated >= target_rad - tol_rad:
+            if is_right:
+                reached = accumulated <= target_rad + tol_rad
+            else:
+                reached = accumulated >= target_rad - tol_rad
+
+            if reached:
                 self.publish_car_control("STOP")
                 time.sleep(0.03)
                 self.get_logger().info(
@@ -243,7 +258,7 @@ class RectangleDriveNode(RosCommunicator):
                 )
                 return True
 
-            self.publish_car_control(TURN_ACTION)
+            self.publish_car_control(turn_action)
             time.sleep(TURN_PULSE_SEC)
             self.publish_car_control("STOP")
             time.sleep(0.03)
@@ -281,7 +296,7 @@ class RectangleDriveNode(RosCommunicator):
                 return
 
             if side_idx < NUM_SIDES:
-                if not self._turn_left(self.turn_degs[side_idx - 1], side_idx):
+                if not self._turn(self.turn_degs[side_idx - 1], side_idx):
                     self.get_logger().error(f"第 {side_idx} 次轉彎失敗，任務中止。")
                     return
 
