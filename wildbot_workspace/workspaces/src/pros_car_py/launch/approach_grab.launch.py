@@ -31,26 +31,26 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "turn_deg",
                 default_value="48.5",
-                description="Right turn between forward segments (degrees).",
+                description="Left turn between forward segments (degrees).",
             ),
             DeclareLaunchArgument(
                 "grab_turn1_deg",
-                default_value="0.0",
-                description="Incremental turn before 1st grasp (0 = grasp at leg-2 heading).",
+                default_value="16.0",
+                description="Incremental left turn before 1st grasp (degrees).",
             ),
             DeclareLaunchArgument(
                 "grab_turn2_deg",
-                default_value="120.0",
-                description="Incremental turn before 2nd grasp.",
+                default_value="32.0",
+                description="Incremental left turn before 2nd grasp (degrees).",
             ),
             DeclareLaunchArgument(
                 "grab_turn3_deg",
-                default_value="120.0",
-                description="Incremental turn before 3rd grasp.",
+                default_value="48.0",
+                description="Incremental left turn before 3rd grasp (degrees).",
             ),
             DeclareLaunchArgument(
                 "grab_turn_direction",
-                default_value="right",
+                default_value="left",
                 description="Turn direction for grab sweeps: right or left.",
             ),
             Node(

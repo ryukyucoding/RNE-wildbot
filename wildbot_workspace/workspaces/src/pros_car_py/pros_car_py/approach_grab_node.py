@@ -1,7 +1,7 @@
 """
 接近並抓取（approach_grab）
 
-行為：前進 → 右轉 → 前進 → 在三個角度各嘗試夾取一次（odom 閉迴路，不需 YOLO / Nav2）。
+行為：前進 → 左轉 → 前進 → 在三個角度各嘗試夾取一次（odom 閉迴路，不需 YOLO / Nav2）。
 
 用法（wildbot 容器內）：
   cd /workspaces
@@ -9,7 +9,7 @@
   ros2 run pros_car_py approach_grab
   ros2 run pros_car_py approach_grab --ros-args \
     -p forward1_m:=0.85 -p forward2_m:=0.55 -p turn_deg:=48.5 \
-    -p grab_turn1_deg:=0.0 -p grab_turn2_deg:=120.0 -p grab_turn3_deg:=120.0
+    -p grab_turn1_deg:=16.0 -p grab_turn2_deg:=32.0 -p grab_turn3_deg:=48.0
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 DEFAULT_FORWARD1_M = 0.85
 DEFAULT_FORWARD2_M = 0.55
 DEFAULT_TURN_DEG = 48.5
-DEFAULT_GRAB_TURNS_DEG = (0.0, 120.0, 120.0)
+DEFAULT_GRAB_TURNS_DEG = (16.0, 32.0, 48.0)
 TURN_TOLERANCE_DEG = 2.0
 FORWARD_ACTION = "FORWARD_SLOW"
 TURN_RIGHT_ACTION = "CLOCKWISE_ROTATION"
@@ -64,7 +64,7 @@ class ApproachGrabNode(RosCommunicator):
         self.declare_parameter("grab_turn1_deg", DEFAULT_GRAB_TURNS_DEG[0])
         self.declare_parameter("grab_turn2_deg", DEFAULT_GRAB_TURNS_DEG[1])
         self.declare_parameter("grab_turn3_deg", DEFAULT_GRAB_TURNS_DEG[2])
-        self.declare_parameter("grab_turn_direction", "right")
+        self.declare_parameter("grab_turn_direction", "left")
         self.declare_parameter("grasp_pause_sec", 1.0)
         self.declare_parameter("reopen_gripper_between_tries", True)
         self.declare_parameter("raise_arm_on_start", True)
@@ -95,7 +95,7 @@ class ApproachGrabNode(RosCommunicator):
 
         self.get_logger().info(
             "Approach grab config: "
-            f"forward1={self.forward1_m:.2f}m, turn={self.turn_deg:.1f}° (right), "
+            f"forward1={self.forward1_m:.2f}m, turn={self.turn_deg:.1f}° (left), "
             f"forward2={self.forward2_m:.2f}m, "
             f"grab_turns=[{', '.join(f'{d:.1f}°' for d in self.grab_turn_degs[:self.num_grab_attempts])}] "
             f"({self.grab_turn_direction}), "
@@ -334,7 +334,7 @@ class ApproachGrabNode(RosCommunicator):
             self.get_logger().error("第一段前進失敗，任務中止。")
             return
 
-        if not self._turn(self.turn_deg, 1, "right"):
+        if not self._turn(self.turn_deg, 1, "left"):
             self.get_logger().error("轉彎失敗，任務中止。")
             return
 

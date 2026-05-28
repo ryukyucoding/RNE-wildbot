@@ -107,7 +107,7 @@ sleep 10 && docker restart compose-localization-1
 
 ```bash
 cd ~/RNE/wildbot_workspace
-./scripts/set_initial_pose.sh -0.08394520834554864 -2.9623971338538015 -0.4108
+./scripts/set_initial_pose.sh 1.281666937320418 -2.370965180685683 -0.0979
 ```
 
 > **座標更新方式**：機器人放好、AMCL 收斂後，跑一次 `./scripts/save_current_pose.sh`，
@@ -187,7 +187,7 @@ ros2 run pros_car_py bear_mission --ros-args \
 
 `amcl_wait_timeout_sec` 建議 **30.0** 以上（留時間設 initial pose）。有 AMCL 時會記錄 map 座標 home，夾取後用 **Nav2 NavigateToPose** 回家（不再被 odom 回程搶先）。
 
-若 log 出現 `**Goal rejected`** / `**Action server is inactive**`：Nav2 在設 initial pose 前就啟動了。解法：
+若 log 出現 `**Goal rejected`** / `**Action server is inactive`**：Nav2 在設 initial pose 前就啟動了。解法：
 
 ```bash
 ./scripts/set_initial_pose.sh <Step4的座標>
@@ -229,7 +229,7 @@ cd ~/RNE/workspace/pros/ros2_yolo_integration
 cd /workspaces && colcon build --symlink-install && source install/setup.bash
 ros2 run yolo_example_pkg yolo_node --ros-args \
   --remap /camera/image/compressed:=/camera/color/image_raw/compressed \
-  -p camera_optical_frame:=camera_color_optical_frame
+  -p camera_optical_frame:=camera_color_optical_frame \ -p target_class:=knob
 ```
 
 ---
@@ -251,12 +251,14 @@ ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/Joint
 
 用逗號串接多個動作，取代單純的 `startup_forward_m`：
 
-| Token | 動作 | 單位 |
-|-------|------|------|
-| `F:<m>` | 前進 | 公尺 |
-| `B:<m>` | 後退 | 公尺 |
-| `R:<deg>` | 原地右轉（順時鐘） | 度 |
-| `L:<deg>` | 原地左轉（逆時鐘） | 度 |
+
+| Token     | 動作        | 單位  |
+| --------- | --------- | --- |
+| `F:<m>`   | 前進        | 公尺  |
+| `B:<m>`   | 後退        | 公尺  |
+| `R:<deg>` | 原地右轉（順時鐘） | 度   |
+| `L:<deg>` | 原地左轉（逆時鐘） | 度   |
+
 
 ```
 -p startup_moves:="F:0.85,R:90,F:0.50"   # 前進 0.85m → 右轉 90° → 前進 0.50m
@@ -265,11 +267,11 @@ ros2 topic pub --once /arm_controller/joint_trajectory trajectory_msgs/msg/Joint
 ```
 
 原本：
+
 ```
   -p startup_forward_m:=0.85 \
   -p startup_forward_speed:=0.25
 ```
-
 
 > `startup_moves` 有設定時會優先執行，忽略 `startup_forward_m`。
 > 不設 `startup_moves` 則維持舊行為（`startup_forward_m` 直線前進）。
@@ -295,7 +297,7 @@ ros2 run pros_car_py bear_mission --ros-args \
   -p visual_servo_depth_ema_alpha:=0.20 \
   -p approach_max_speed_mps:=0.80 \
   -p visual_servo_max_forward_speed_far:=500.0 \
-  -p obstacle_source_debug_enabled:=true \
+  -p obstacle_source_debug_enabled:=false \
   -p approach_yolo_lost_grace_sec:=1.5 \
   -p approach_yolo_search_spin_speed_tier:=slow \
   -p approach_yolo_explore_forward_sec:=2.0 \
@@ -448,17 +450,15 @@ ros2 topic pub --once /base_controller/cmd_vel geometry_msgs/msg/TwistStamped \
 
 # 在 wildbot 容器內執行（背景跑
 
-ros2 run tf2_ros static_transform_publisher   
-  --x 0.105 --y 0.0 --z 0.255   
-  --roll 0 --pitch 0 --yaw 0   
+ros2 run tf2_ros static_transform_publisher  
+  --x 0.105 --y 0.0 --z 0.255  
+  --roll 0 --pitch 0 --yaw 0  
   --frame-id base_link --child-frame-id camera_link &
 
 驗證 TF 有沒有通
 ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame
 
 第一步：進入容器
-
-
 
   進去後先 source：
   source /opt/ros/jazzy/setup.bash
@@ -468,11 +468,11 @@ ros2 run tf2_ros tf2_echo base_link camera_color_optical_frame
 ##車輪控制
 
   往前走：
-  ros2 topic pub -r 10 /base_controller/cmd_vel geometry_msgs/msg/TwistStamped   
+  ros2 topic pub -r 10 /base_controller/cmd_vel geometry_msgs/msg/TwistStamped  
   "{header: {frame_id: 'base_link'}, twist: {linear: {x: 0.3}, angular: {z: 0.2}}}"
 
   停止（一定要記得停）：
-  ros2 topic pub --once /base_controller/cmd_vel geometry_msgs/msg/TwistStamped   
+  ros2 topic pub --once /base_controller/cmd_vel geometry_msgs/msg/TwistStamped  
   "{header: {frame_id: 'base_link'}, twist: {linear: {x: 0.0}, angular: {z: 0.0}}}"
 
   左轉： angular: {z: 0.4} ／ 右轉： angular: {z: -0.4}
@@ -502,18 +502,18 @@ cd /workspaces
 colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
 
 # 上橋
+
 ```bash
 cd /workspaces
 colcon build --packages-select pros_car_py --symlink-install && source install/setup.bash
 
 ros2 run pros_car_py rectangle_drive --ros-args \
--p length_m:=0.87 -p width_m:=2.95 -p side2_m:=2.95 \
+-p length_m:=0.07 -p width_m:=2.95 -p side2_m:=2.95 \
 -p turn1_deg:=48.45 -p turn2_deg:=48.5 -p turn3_deg:=53.0
 ```
 
-
-
 # 左右移動
+
 ```bash
 docker exec -it wildbot bash
 
@@ -521,3 +521,4 @@ source /opt/ros/jazzy/setup.bash
 source /workspaces/install/setup.bash
 python3 /workspaces/teleop_key.py
 ```
+
