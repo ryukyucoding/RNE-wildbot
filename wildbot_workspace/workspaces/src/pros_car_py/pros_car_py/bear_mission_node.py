@@ -127,6 +127,10 @@ class BearMissionHost(RosCommunicator):
         self.declare_parameter("nav_feedback_log_sec", 1.5)
         self.declare_parameter("nav_stuck_time_sec", 8.0)
         self.declare_parameter("nav_stuck_min_progress_m", 0.08)
+        self.declare_parameter("amcl_converge_max_cov", 0.5)
+        self.declare_parameter("odom_max_trust_dist_m", 2.5)
+        self.declare_parameter("odom_amcl_upgrade_enabled", True)
+        self.declare_parameter("amcl_pose_max_age_sec", 3.0)
         self.declare_parameter("nav_unstick_enabled", True)
         self.declare_parameter("nav_unstick_back_sec", 0.8)
         self.declare_parameter("nav_unstick_rotate_sec", 0.8)
@@ -1359,6 +1363,17 @@ class BearMissionHost(RosCommunicator):
             self.get_parameter("amcl_wait_timeout_sec").get_parameter_value().double_value
         )
         amcl_wait = max(5.0, amcl_wait)
+        amcl_converge_max_cov = (
+            self.get_parameter("amcl_converge_max_cov")
+            .get_parameter_value()
+            .double_value
+        )
+        amcl_converge_max_cov = max(0.0, amcl_converge_max_cov)
+        amcl_pose_max_age_sec = (
+            self.get_parameter("amcl_pose_max_age_sec")
+            .get_parameter_value()
+            .double_value
+        )
 
         amcl_topic = (
             self.get_parameter("amcl_pose_topic").get_parameter_value().string_value
@@ -1397,24 +1412,70 @@ class BearMissionHost(RosCommunicator):
             f"Recording home pose from '{amcl_topic}' (waiting up to {amcl_wait:.0f}s) …"
         )
         home_pose = None
+        best_amcl_pose = None
+        best_amcl_cov = float("inf")
+        stale_pose_seen = False
         t0 = time.monotonic()
         last_log = t0
         while time.monotonic() - t0 < amcl_wait and rclpy.ok():
             pose_msg = self.get_latest_amcl_pose()
-            if pose_msg is not None:
-                home_pose = copy.deepcopy(pose_msg.pose.pose)
-                self.get_logger().info(
-                    f"Home pose recorded from '{amcl_topic}': "
-                    f"x={home_pose.position.x:.3f}, y={home_pose.position.y:.3f}"
-                )
-                break
+            pose_is_fresh = (
+                pose_msg is not None
+                and self._amcl_pose_is_fresh(pose_msg, amcl_pose_max_age_sec)
+            )
+            if pose_msg is not None and not pose_is_fresh:
+                stale_pose_seen = True
+            if pose_is_fresh:
+                cov_sum = self._amcl_xy_cov_sum(pose_msg)
+                if cov_sum is None:
+                    home_pose = copy.deepcopy(pose_msg.pose.pose)
+                    self.get_logger().info(
+                        f"Home pose recorded from '{amcl_topic}' "
+                        "(covariance unavailable): "
+                        f"x={home_pose.position.x:.3f}, y={home_pose.position.y:.3f}"
+                    )
+                    break
+                if cov_sum < best_amcl_cov:
+                    best_amcl_cov = cov_sum
+                    best_amcl_pose = copy.deepcopy(pose_msg.pose.pose)
+                if cov_sum < amcl_converge_max_cov:
+                    home_pose = copy.deepcopy(pose_msg.pose.pose)
+                    self.get_logger().info(
+                        f"Home pose recorded from '{amcl_topic}': "
+                        f"x={home_pose.position.x:.3f}, y={home_pose.position.y:.3f}, "
+                        f"xy_cov_sum={cov_sum:.4f}"
+                    )
+                    break
             now = time.monotonic()
             if now - last_log >= 5.0:
-                self.get_logger().warn(
-                    f"Still waiting for '{amcl_topic}' — 跳過 AMCL，將使用 odom 回程。"
-                )
+                if best_amcl_pose is None:
+                    if stale_pose_seen:
+                        self.get_logger().warn(
+                            f"'{amcl_topic}' only has stale latched pose "
+                            f"(>{amcl_pose_max_age_sec:.1f}s old) — AMCL likely "
+                            "not publishing; will use odom return if AMCL stays silent."
+                        )
+                    else:
+                        self.get_logger().warn(
+                            f"Still waiting for '{amcl_topic}' — 跳過 AMCL，將使用 odom 回程。"
+                        )
+                else:
+                    self.get_logger().warn(
+                        f"Still waiting for converged '{amcl_topic}' "
+                        f"(best xy_cov_sum={best_amcl_cov:.4f}, "
+                        f"threshold={amcl_converge_max_cov:.4f}) — keep waiting."
+                    )
                 last_log = now
             time.sleep(0.05)
+
+        if home_pose is None and best_amcl_pose is not None:
+            home_pose = best_amcl_pose
+            self.get_logger().warn(
+                f"AMCL did not converge below covariance threshold "
+                f"(best xy_cov_sum={best_amcl_cov:.4f}, "
+                f"threshold={amcl_converge_max_cov:.4f}); "
+                "using best available home pose."
+            )
 
         if home_pose is None:
             self.get_logger().warn(
@@ -2321,23 +2382,48 @@ class BearMissionHost(RosCommunicator):
                 self.get_logger().info(
                     "開始 odom-based 回起點導航（面向起點前進，到站放下後對正起始朝向）…"
                 )
-                odom_arrived = self._navigate_home_odom(
+                odom_result = self._navigate_home_odom(
                     home_odom,
                     timeout=90.0,
                     arrive_thresh=home_reached_thresh,
                 )
+                odom_arrived = odom_result == "ARRIVED"
+                finish_home_pose = home_odom
+                finish_uses_odom = True
+                if odom_result == "AMCL_AVAILABLE":
+                    upgraded_home_pose = self._estimate_map_home_from_odom(home_odom)
+                    if upgraded_home_pose is not None:
+                        self.get_logger().info(
+                            "AMCL became available during odom return; "
+                            "switching to AMCL fallback home drive."
+                        )
+                        odom_arrived = self._fallback_drive_home(
+                            home_pose=upgraded_home_pose,
+                            timeout_sec=fallback_home_timeout_sec,
+                            arrival_xy_thresh_m=fallback_arrival_xy_thresh_m,
+                            heading_thresh_deg=fallback_heading_thresh_deg,
+                            rotate_step_sec=fallback_rotate_step_sec,
+                            forward_step_sec=fallback_forward_step_sec,
+                        )
+                        finish_home_pose = upgraded_home_pose
+                        finish_uses_odom = False
+                    else:
+                        self.get_logger().warn(
+                            "AMCL appeared during odom return, but map home pose "
+                            "could not be estimated; continue with odom finish check."
+                        )
                 if not odom_arrived:
                     self.get_logger().warn("Odom 回程未到達起點附近。")
                 self._finish_at_home(
                     arm=arm,
-                    home_pose=home_odom,
+                    home_pose=finish_home_pose,
                     drop_at_home=drop_at_home,
                     arrival_thresh_m=home_reached_thresh,
                     align_after_drop=align_home_heading_after_drop,
                     heading_thresh_deg=fallback_heading_thresh_deg,
                     rotate_step_sec=fallback_rotate_step_sec,
                     align_timeout_sec=home_heading_align_timeout_sec,
-                    use_odom=True,
+                    use_odom=finish_uses_odom,
                 )
             else:
                 self.get_logger().info("home_pose 未記錄且無 odom home，跳過回起點。任務完成。")
@@ -2941,6 +3027,42 @@ class BearMissionHost(RosCommunicator):
         return inner.pose
 
     @staticmethod
+    def _amcl_xy_cov_sum(msg) -> float | None:
+        """Return x+y covariance for AMCL pose quality checks (NaN/Inf filtered)."""
+        try:
+            cov = msg.pose.covariance
+            cov_sum = float(cov[0]) + float(cov[7])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+        if not math.isfinite(cov_sum) or cov_sum < 0.0:
+            return None
+        return cov_sum
+
+    def _amcl_pose_is_fresh(self, msg, max_age_sec: float) -> bool:
+        """
+        AMCL uses TRANSIENT_LOCAL durability, so `get_latest_amcl_pose()` may return
+        a latched pose published long ago. Reject anything older than max_age_sec.
+        max_age_sec <= 0 disables the check.
+        """
+        if msg is None:
+            return False
+        if max_age_sec <= 0.0:
+            return True
+        try:
+            stamp = msg.header.stamp
+            stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        except (AttributeError, TypeError, ValueError):
+            return True
+        if stamp_ns <= 0:
+            return True
+        try:
+            now_ns = self.get_clock().now().nanoseconds
+        except Exception:
+            return True
+        age_sec = (now_ns - stamp_ns) / 1e9
+        return age_sec <= max_age_sec
+
+    @staticmethod
     def _yaw_to_quaternion(yaw: float) -> Quaternion:
         q = Quaternion()
         q.z = math.sin(yaw / 2.0)
@@ -3474,13 +3596,96 @@ class BearMissionHost(RosCommunicator):
         self.publish_car_control("STOP")
         return False
 
+    def _estimate_map_home_from_odom(self, home_odom_pose):
+        """
+        Estimate the recorded odom home in map frame when AMCL becomes available late.
+
+        The current AMCL pose gives map->base and current odom gives odom->base.
+        Applying that transform to the recorded odom home avoids treating the
+        current robot pose as home.
+
+        Returns None when inputs are missing/stale or the result fails sanity checks.
+        """
+        if home_odom_pose is None:
+            return None
+        odom_msg = self.get_latest_odom()
+        amcl_msg = self.get_latest_amcl_pose()
+        if odom_msg is None or amcl_msg is None:
+            return None
+        amcl_max_age = (
+            self.get_parameter("amcl_pose_max_age_sec")
+            .get_parameter_value()
+            .double_value
+        )
+        if not self._amcl_pose_is_fresh(amcl_msg, amcl_max_age):
+            self.get_logger().warn(
+                "[nav_odom] Cannot upgrade: AMCL pose is stale "
+                f"(>{amcl_max_age:.1f}s old)."
+            )
+            return None
+
+        cur_odom = odom_msg.pose.pose
+        cur_map = amcl_msg.pose.pose
+        try:
+            odom_yaw = self._yaw_from_quat(cur_odom.orientation)
+            map_yaw = self._yaw_from_quat(cur_map.orientation)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not (math.isfinite(odom_yaw) and math.isfinite(map_yaw)):
+            return None
+        yaw_delta = self._normalize_angle(map_yaw - odom_yaw)
+
+        dx_odom = float(home_odom_pose.position.x - cur_odom.position.x)
+        dy_odom = float(home_odom_pose.position.y - cur_odom.position.y)
+        if not (math.isfinite(dx_odom) and math.isfinite(dy_odom)):
+            return None
+
+        odom_disp = math.hypot(dx_odom, dy_odom)
+        odom_max_trust = max(
+            0.0,
+            self.get_parameter("odom_max_trust_dist_m")
+            .get_parameter_value()
+            .double_value,
+        )
+        if odom_max_trust > 0.0 and odom_disp > odom_max_trust * 4.0 + 1.0:
+            self.get_logger().warn(
+                f"[nav_odom] Odom-frame home is {odom_disp:.2f}m from current "
+                f"odom pose (>{odom_max_trust * 4.0 + 1.0:.2f}m); "
+                "map-frame home estimate may be unreliable due to drift."
+            )
+
+        cos_d = math.cos(yaw_delta)
+        sin_d = math.sin(yaw_delta)
+
+        home_map = copy.deepcopy(cur_map)
+        home_map.position.x = float(cur_map.position.x) + cos_d * dx_odom - sin_d * dy_odom
+        home_map.position.y = float(cur_map.position.y) + sin_d * dx_odom + cos_d * dy_odom
+        home_map.position.z = 0.0
+
+        if not (
+            math.isfinite(home_map.position.x) and math.isfinite(home_map.position.y)
+        ):
+            self.get_logger().warn(
+                "[nav_odom] Map-frame home estimate produced non-finite values; "
+                "rejecting upgrade."
+            )
+            return None
+
+        home_odom_yaw = self._yaw_from_quat(home_odom_pose.orientation)
+        if not math.isfinite(home_odom_yaw):
+            home_odom_yaw = 0.0
+        home_map.orientation = self._yaw_to_quaternion(
+            self._normalize_angle(home_odom_yaw + yaw_delta)
+        )
+        return home_map
+
     def _navigate_home_odom(
         self,
         home_pose,
         timeout=90.0,
         arrive_thresh=0.25,
         heading_thresh=0.25,
-    ) -> bool:
+    ) -> str:
         """
         Odom-based 回程：面向起點前進直到進入 arrival 半徑。
         放下與對正起始朝向由 _finish_at_home() 負責。
@@ -3488,6 +3693,30 @@ class BearMissionHost(RosCommunicator):
         t_start = time.monotonic()
         home_x = float(home_pose.position.x)
         home_y = float(home_pose.position.y)
+        odom_max_trust_dist_m = (
+            self.get_parameter("odom_max_trust_dist_m")
+            .get_parameter_value()
+            .double_value
+        )
+        odom_max_trust_dist_m = max(0.0, odom_max_trust_dist_m)
+        odom_amcl_upgrade_enabled = (
+            self.get_parameter("odom_amcl_upgrade_enabled")
+            .get_parameter_value()
+            .bool_value
+        )
+        amcl_pose_max_age_sec = (
+            self.get_parameter("amcl_pose_max_age_sec")
+            .get_parameter_value()
+            .double_value
+        )
+        amcl_converge_max_cov = (
+            self.get_parameter("amcl_converge_max_cov")
+            .get_parameter_value()
+            .double_value
+        )
+        amcl_converge_max_cov = max(0.0, amcl_converge_max_cov)
+        initial_dist_warned = False
+        last_amcl_upgrade_check = 0.0
 
         self.get_logger().info(
             f"[nav_odom] 目標位置: x={home_x:.3f}, y={home_y:.3f} "
@@ -3508,6 +3737,33 @@ class BearMissionHost(RosCommunicator):
             dx = home_x - cur_x
             dy = home_y - cur_y
             dist = math.hypot(dx, dy)
+            if not initial_dist_warned:
+                initial_dist_warned = True
+                if dist > odom_max_trust_dist_m:
+                    self.get_logger().warn(
+                        f"[nav_odom] Initial odom return distance {dist:.2f}m "
+                        f"exceeds trust limit {odom_max_trust_dist_m:.2f}m; "
+                        "odom drift may affect release accuracy."
+                    )
+
+            now = time.monotonic()
+            if odom_amcl_upgrade_enabled and now - last_amcl_upgrade_check >= 1.0:
+                last_amcl_upgrade_check = now
+                amcl_pose_msg = self.get_latest_amcl_pose()
+                if self._amcl_pose_is_fresh(
+                    amcl_pose_msg, amcl_pose_max_age_sec
+                ):
+                    cov_sum = self._amcl_xy_cov_sum(amcl_pose_msg)
+                    if cov_sum is None or cov_sum < amcl_converge_max_cov:
+                        self.publish_car_control("STOP")
+                        cov_text = (
+                            "n/a" if cov_sum is None else f"{cov_sum:.4f}"
+                        )
+                        self.get_logger().info(
+                            "[nav_odom] AMCL pose available and converged "
+                            f"(xy_cov_sum={cov_text}); request map-frame upgrade."
+                        )
+                        return "AMCL_AVAILABLE"
 
             if dist <= arrive_thresh:
                 self.publish_car_control("STOP")
@@ -3515,7 +3771,7 @@ class BearMissionHost(RosCommunicator):
                     f"[nav_odom] 到達起點附近 dist={dist:.2f}m — "
                     "hand off to drop + heading align."
                 )
-                return True
+                return "ARRIVED"
 
             target_yaw = math.atan2(dy, dx)
             yaw_err = self._normalize_angle(target_yaw - cur_yaw)
@@ -3538,7 +3794,7 @@ class BearMissionHost(RosCommunicator):
 
         self.publish_car_control("STOP")
         self.get_logger().warn("[nav_odom] 回程 timeout，停止。")
-        return False
+        return "TIMEOUT"
 
     @staticmethod
     def _yaw_from_quat(q) -> float:
